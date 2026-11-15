@@ -1,0 +1,52 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --tema-bg-canvas: #f8fafc;
+    --tema-bg-surface: #ffffff;
+    --tema-bg-subtle: #f1f5f9;
+    --tema-border: #e2e8f0;
+    --tema-text-primary: #0f172a;
+    --tema-text-secondary: #475569;
+    --tema-text-muted: #64748b;
+    --tema-primary: #0f2942;
+    --tema-secondary: #1d4ed8;
+    --tema-accent: #0d9488;
+  }
+
+  .dark {
+    --tema-bg-canvas: #070d18;
+    --tema-bg-surface: #0f172a;
+    --tema-bg-subtle: #1e293b;
+    --tema-border: #1e293b;
+    --tema-text-primary: #f1f5f9;
+    --tema-text-secondary: #cbd5e1;
+    --tema-text-muted: #94a3b8;
+    --tema-primary: #3b82f6;
+    --tema-secondary: #60a5fa;
+    --tema-accent: #14b8a6;
+  }
+
+  html {
+    font-family: "IBM Plex Sans Arabic", "Plus Jakarta Sans", system-ui, -apple-system, sans-serif;
+  }
+
+  body {
+    background-color: var(--tema-bg-canvas);
+    color: var(--tema-text-primary);
+  }
+}
+
+.font-display-latin {
+  font-family: "Plus Jakarta Sans", "IBM Plex Sans Arabic", sans-serif;
+}
+
+.font-mono-tabular {
+  font-family: "IBM Plex Mono", monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}

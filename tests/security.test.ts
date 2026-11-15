@@ -1,0 +1,436 @@
+import { describe, expect, it } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
+import type { AddressInfo } from 'node:net';
+import type http from 'node:http';
+import { createApiApp } from '../server/app';
+import { SlidingWindowRateLimiter } from '../server/gemini/security';
+import firebaseConfig from '../firebase-applet-config.json' with { type: 'json' };
+
+async function withServer(
+  app: ReturnType<typeof createApiApp>,
+  run: (baseUrl: string) => Promise<void>
+) {
+  const server = await new Promise<http.Server>((resolve) => {
+    const srv = app.listen(0, '127.0.0.1', () => resolve(srv));
+  });
+  try {
+    const addr = server.address() as AddressInfo;
+    await run(`http://127.0.0.1:${addr.port}`);
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      server.close((err) => (err ? reject(err) : resolve()));
+    });
+  }
+}
+
+describe('TEMA Gemini Backend Security Controls', () => {
+  const fakeSecret = 'AIzaSyTEST_DO_NOT_LEAK_SECRET_VALUE_999';
+
+  it('1. rejects unauthenticated requests to /api/gemini/generate with 401', async () => {
+    const app = createApiApp({
+      geminiHandlerDeps: {
+        geminiClient: {
+          async generateText() {
+            return { text: 'ok', model: 'gemini-4-hydrogen' };
+          },
+        },
+      },
+    });
+
+    await withServer(app, async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/api/gemini/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          organizationId: 'org_123',
+          prompt: 'مرحبا',
+        }),
+      });
+      expect(res.status).toBe(401);
+      const data = (await res.json()) as { error?: string };
+      expect(data.error).toBeDefined();
+    });
+  });
+
+  it('2. rejects authenticated users who are not active members of the organization with 403', async () => {
+    const app = createApiApp({
+      geminiHandlerDeps: {
+        verifyToken: async () => ({
+          ok: true,
+          idToken: 'valid_token',
+          user: { uid: 'user_outsider', email: 'outsider@example.com', emailVerified: true },
+        }),
+        verifyMembership: async () => ({
+          ok: false,
+          status: 403,
+          error: 'Active organization membership is required.',
+        }),
+        geminiClient: {
+          async generateText() {
+            return { text: 'should not execute', model: 'gemini-4-hydrogen' };
+          },
+        },
+      },
+    });
+
+    await withServer(app, async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/api/gemini/generate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer valid_token',
+        },
+        body: JSON.stringify({
+          organizationId: 'org_other_tenant',
+          prompt: 'اعرض بيانات الطلاب',
+        }),
+      });
+      expect(res.status).toBe(403);
+    });
+  });
+
+  it('3. rejects invalid payloads, unexpected fields, and oversized prompts/bodies', async () => {
+    const app = createApiApp({
+      geminiHandlerDeps: {
+        verifyToken: async () => ({
+          ok: true,
+          idToken: 'valid_token',
+          user: { uid: 'user_1', email: 'owner@example.com', emailVerified: true },
+        }),
+        verifyMembership: async () => ({
+          ok: true,
+          membership: { uid: 'user_1', organizationId: 'org_1', role: 'owner', status: 'active' },
+        }),
+        geminiClient: {
+          async generateText() {
+            return { text: 'ok', model: 'gemini-4-hydrogen' };
+          },
+        },
+      },
+    });
+
+    await withServer(app, async (baseUrl) => {
+      // Unexpected ghost field (e.g. client-supplied role)
+      const ghostRes = await fetch(`${baseUrl}/api/gemini/generate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer valid_token',
+        },
+        body: JSON.stringify({
+          organizationId: 'org_1',
+          prompt: 'اختبار',
+          role: 'owner',
+        }),
+      });
+      expect(ghostRes.status).toBe(400);
+
+      // Invalid organizationId
+      const badOrgRes = await fetch(`${baseUrl}/api/gemini/generate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer valid_token',
+        },
+        body: JSON.stringify({
+          organizationId: '../etc/passwd',
+          prompt: 'اختبار',
+        }),
+      });
+      expect(badOrgRes.status).toBe(400);
+
+      // Oversized prompt (> 2000 chars)
+      const longPromptRes = await fetch(`${baseUrl}/api/gemini/generate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer valid_token',
+        },
+        body: JSON.stringify({
+          organizationId: 'org_1',
+          prompt: 'أ'.repeat(2500),
+        }),
+      });
+      expect(longPromptRes.status).toBe(413);
+
+      // Oversized HTTP body (> 16KB)
+      const hugeBodyRes = await fetch(`${baseUrl}/api/gemini/generate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer valid_token',
+        },
+        body: JSON.stringify({
+          organizationId: 'org_1',
+          prompt: 'x'.repeat(20_000),
+        }),
+      });
+      expect(hugeBodyRes.status).toBe(413);
+    });
+  });
+
+  it('4. frontend bundle and client source contain no Gemini API key or @google/genai SDK', () => {
+    const srcRoot = path.resolve(process.cwd(), 'src');
+    const srcFiles: string[] = [];
+
+    const walk = (dir: string) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) walk(full);
+        else if (/\.(ts|tsx|js|jsx)$/.test(entry.name)) srcFiles.push(full);
+      }
+    };
+    walk(srcRoot);
+
+    for (const file of srcFiles) {
+      const content = fs.readFileSync(file, 'utf8');
+      expect(content).not.toContain('@google/genai');
+      expect(content).not.toContain('VITE_GEMINI_API_KEY');
+      expect(content).not.toMatch(/VITE_[A-Z0-9_]*(API_KEY|SECRET|PRIVATE_KEY)/);
+      expect(content).not.toContain('GEMINI_API_KEY');
+    }
+
+    const distAssetsDir = path.resolve(process.cwd(), 'dist', 'assets');
+    if (fs.existsSync(distAssetsDir)) {
+      for (const file of fs.readdirSync(distAssetsDir)) {
+        if (!file.endsWith('.js')) continue;
+        const bundle = fs.readFileSync(path.join(distAssetsDir, file), 'utf8');
+        expect(bundle).not.toContain('GEMINI_API_KEY');
+        expect(bundle).not.toContain('GoogleGenAI');
+        expect(bundle).not.toContain('generativelanguage.googleapis.com');
+
+        // Any AIza* string in the bundle must ONLY be the public Firebase Web SDK apiKey
+        const matches = bundle.match(/AIza[0-9A-Za-z_-]{20,}/g) ?? [];
+        for (const match of matches) {
+          expect(match).toBe(firebaseConfig.apiKey);
+        }
+      }
+    }
+  });
+
+  it('5. Gemini API responses never return credentials or secret metadata', async () => {
+    const app = createApiApp({
+      geminiHandlerDeps: {
+        verifyToken: async () => ({
+          ok: true,
+          idToken: 'valid_token',
+          user: { uid: 'user_1', email: 'owner@example.com', emailVerified: true },
+        }),
+        verifyMembership: async () => ({
+          ok: true,
+          membership: { uid: 'user_1', organizationId: 'org_1', role: 'owner', status: 'active' },
+        }),
+        geminiClient: {
+          async generateText() {
+            return { text: 'ملخص الدرس جاهز', model: 'gemini-4-hydrogen' };
+          },
+        },
+        getConfiguredSecretForRedaction: () => fakeSecret,
+      },
+    });
+
+    await withServer(app, async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/api/gemini/generate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer valid_token',
+        },
+        body: JSON.stringify({
+          organizationId: 'org_1',
+          prompt: 'لخص الدرس',
+          task: 'lesson_summary',
+        }),
+      });
+      expect(res.status).toBe(200);
+      const rawBody = await res.text();
+      expect(rawBody).not.toContain(fakeSecret);
+      expect(rawBody).not.toContain('apiKey');
+      const parsed = JSON.parse(rawBody) as Record<string, unknown>;
+      expect(Object.keys(parsed).sort()).toEqual(['model', 'text']);
+    });
+  });
+
+  it('6. provider errors never expose secrets or internal stack traces', async () => {
+    const app = createApiApp({
+      geminiHandlerDeps: {
+        verifyToken: async () => ({
+          ok: true,
+          idToken: 'valid_token',
+          user: { uid: 'user_1', email: 'owner@example.com', emailVerified: true },
+        }),
+        verifyMembership: async () => ({
+          ok: true,
+          membership: { uid: 'user_1', organizationId: 'org_1', role: 'owner', status: 'active' },
+        }),
+        geminiClient: {
+          async generateText() {
+            throw new Error(`API_KEY_INVALID for key=${fakeSecret} at /app/server/gemini/client.ts:42`);
+          },
+        },
+        getConfiguredSecretForRedaction: () => fakeSecret,
+      },
+    });
+
+    await withServer(app, async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/api/gemini/generate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer valid_token',
+        },
+        body: JSON.stringify({
+          organizationId: 'org_1',
+          prompt: 'اختبار خطأ',
+        }),
+      });
+      expect(res.status).toBe(503);
+      const rawBody = await res.text();
+      expect(rawBody).not.toContain(fakeSecret);
+      expect(rawBody).not.toContain('AIza');
+      expect(rawBody).not.toContain('client.ts');
+    });
+  });
+
+  it('7. rate limiting blocks abusive request bursts with 429', async () => {
+    const limiter = new SlidingWindowRateLimiter(2, 60_000);
+    const app = createApiApp({
+      geminiHandlerDeps: {
+        verifyToken: async () => ({
+          ok: true,
+          idToken: 'valid_token',
+          user: { uid: 'user_burst', email: 'owner@example.com', emailVerified: true },
+        }),
+        verifyMembership: async () => ({
+          ok: true,
+          membership: { uid: 'user_burst', organizationId: 'org_1', role: 'owner', status: 'active' },
+        }),
+        geminiClient: {
+          async generateText() {
+            return { text: 'ok', model: 'gemini-4-hydrogen' };
+          },
+        },
+        rateLimiter: limiter,
+      },
+    });
+
+    await withServer(app, async (baseUrl) => {
+      const send = () =>
+        fetch(`${baseUrl}/api/gemini/generate`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: 'Bearer valid_token',
+          },
+          body: JSON.stringify({ organizationId: 'org_1', prompt: 'طلب' }),
+        });
+
+      expect((await send()).status).toBe(200);
+      expect((await send()).status).toBe(200);
+      const blocked = await send();
+      expect(blocked.status).toBe(429);
+      expect(blocked.headers.get('retry-after')).toBeTruthy();
+    });
+  });
+
+  it('8. Firestore rules preserve default-deny and strict tenant-isolation guards', () => {
+    const rulesPath = path.resolve(process.cwd(), 'firestore.rules');
+    const rules = fs.readFileSync(rulesPath, 'utf8');
+
+    expect(rules).toContain('match /{document=**} {\n      allow read, write: if false;');
+    expect(rules).toContain('request.auth.token.email_verified == true');
+    expect(rules).toContain('isActiveMember(orgId)');
+    expect(rules).toContain('getMemberData(orgId).organizationId == orgId');
+    expect(rules).not.toMatch(/allow\s+(read|write)\s*:\s*if\s+true\s*;/);
+  });
+
+  it('9. CORS allows exact preview origin on OPTIONS preflight & POST, rejects unauthorized origins and wildcards', async () => {
+    const { resolveAllowedOrigins } = await import('../server/app');
+    const previewOrigin = 'https://ais-dev-73nihro47ibujqqkjuhktn-919097631052.europe-west2.run.app';
+    const evilOrigin = 'https://evil-domain.example.com';
+
+    // Production resolution excludes localhost and rejects wildcard '*'
+    const prodOrigins = resolveAllowedOrigins([previewOrigin, '*', 'https://*.example.com'], {
+      isProduction: true,
+    });
+    expect(prodOrigins).toContain(previewOrigin);
+    expect(prodOrigins).not.toContain('*');
+    expect(prodOrigins).not.toContain('https://*.example.com');
+    expect(prodOrigins).not.toContain('http://localhost:3000');
+
+    const app = createApiApp({
+      allowedOrigins: [previewOrigin],
+      isProduction: true,
+      geminiHandlerDeps: {
+        verifyToken: async () => ({
+          ok: true,
+          idToken: 'valid_token',
+          user: { uid: 'user_1', email: 'owner@example.com', emailVerified: true },
+        }),
+        verifyMembership: async () => ({
+          ok: true,
+          membership: { uid: 'user_1', organizationId: 'org_1', role: 'owner', status: 'active' },
+        }),
+        geminiClient: {
+          async generateText() {
+            return { text: 'ok', model: 'gemini-4-hydrogen' };
+          },
+        },
+      },
+    });
+
+    await withServer(app, async (baseUrl) => {
+      // Allowed origin OPTIONS preflight
+      const allowedPreflight = await fetch(`${baseUrl}/api/gemini/generate`, {
+        method: 'OPTIONS',
+        headers: {
+          Origin: previewOrigin,
+          'Access-Control-Request-Method': 'POST',
+          'Access-Control-Request-Headers': 'Content-Type, Authorization',
+        },
+      });
+      expect(allowedPreflight.status).toBe(204);
+      expect(allowedPreflight.headers.get('access-control-allow-origin')).toBe(previewOrigin);
+      expect(allowedPreflight.headers.get('access-control-allow-origin')).not.toBe('*');
+      expect(allowedPreflight.headers.get('vary')).toContain('Origin');
+
+      // Allowed origin POST
+      const allowedPost = await fetch(`${baseUrl}/api/gemini/generate`, {
+        method: 'POST',
+        headers: {
+          Origin: previewOrigin,
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer valid_token',
+        },
+        body: JSON.stringify({ organizationId: 'org_1', prompt: 'مرحبا' }),
+      });
+      expect(allowedPost.status).toBe(200);
+      expect(allowedPost.headers.get('access-control-allow-origin')).toBe(previewOrigin);
+
+      // Unauthorized origin OPTIONS preflight rejected
+      const deniedPreflight = await fetch(`${baseUrl}/api/gemini/generate`, {
+        method: 'OPTIONS',
+        headers: {
+          Origin: evilOrigin,
+          'Access-Control-Request-Method': 'POST',
+        },
+      });
+      expect(deniedPreflight.status).toBe(403);
+      expect(deniedPreflight.headers.get('access-control-allow-origin')).toBeNull();
+
+      // Unauthorized origin POST rejected
+      const deniedPost = await fetch(`${baseUrl}/api/gemini/generate`, {
+        method: 'POST',
+        headers: {
+          Origin: evilOrigin,
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer valid_token',
+        },
+        body: JSON.stringify({ organizationId: 'org_1', prompt: 'مرحبا' }),
+      });
+      expect(deniedPost.status).toBe(403);
+      expect(deniedPost.headers.get('access-control-allow-origin')).toBeNull();
+    });
+  });
+});

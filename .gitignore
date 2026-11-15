@@ -1,0 +1,37 @@
+# Dependencies & Build Outputs
+node_modules/
+functions/node_modules/
+build/
+dist/
+functions/lib/
+coverage/
+
+# Environment & Local Secret Files (Never Commit)
+.env
+.env.*
+!.env.example
+.secret.local
+*.local
+
+# Private Keys, Certificates & Service Accounts
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*service-account*.json
+*serviceAccount*.json
+*firebase-adminsdk*.json
+credentials*.json
+secrets/
+
+# Firebase & Emulator Artifacts
+.firebase/
+firebase-debug.log*
+firestore-debug.log*
+ui-debug.log*
+
+# OS & Logs
+.DS_Store
+*.log
+npm-debug.log*

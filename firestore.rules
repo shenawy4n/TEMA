@@ -1,0 +1,676 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // =========================================================================
+    // Global Primitive Helpers
+    // =========================================================================
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isStrLen(val, minLen, maxLen) {
+      return val is string && val.size() >= minLen && val.size() <= maxLen;
+    }
+
+    function hasValidMemberDoc(orgId) {
+      return exists(/databases/$(database)/documents/organizations/$(orgId)/members/$(request.auth.uid));
+    }
+
+    function getMemberData(orgId) {
+      return get(/databases/$(database)/documents/organizations/$(orgId)/members/$(request.auth.uid)).data;
+    }
+
+    function isActiveMember(orgId) {
+      return isVerifiedUser()
+        && hasValidMemberDoc(orgId)
+        && getMemberData(orgId).status == 'active'
+        && getMemberData(orgId).organizationId == orgId;
+    }
+
+    function hasAnyRole(orgId, allowedRoles) {
+      return isActiveMember(orgId) && getMemberData(orgId).role in allowedRoles;
+    }
+
+    function isOrgOwner(orgId) {
+      return hasAnyRole(orgId, ['owner']);
+    }
+
+    // =========================================================================
+    // Entity Validation Blueprints
+    // =========================================================================
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll([
+          'uid', 'displayName', 'email', 'themePreference', 'organizationIds', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'uid', 'displayName', 'email', 'phone', 'themePreference', 'activeOrganizationId', 'organizationIds', 'createdAt', 'updatedAt'
+        ])
+        && data.uid == userId
+        && isValidId(data.uid)
+        && isStrLen(data.displayName, 1, 100)
+        && isStrLen(data.email, 3, 200)
+        && (!('phone' in data) || isStrLen(data.phone, 0, 30))
+        && data.themePreference in ['light', 'dark', 'system']
+        && (!('activeOrganizationId' in data) || isValidId(data.activeOrganizationId))
+        && data.organizationIds is list
+        && data.organizationIds.size() <= 10
+        && (data.organizationIds.size() == 0 || isValidId(data.organizationIds[0]))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidOrganization(data, orgId) {
+      return data.keys().hasAll([
+          'id', 'name', 'type', 'ownerId', 'ownerName', 'phone', 'email', 'city',
+          'currency', 'language', 'themePreference', 'academicYear', 'status', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'name', 'type', 'ownerId', 'ownerName', 'phone', 'email', 'city', 'address',
+          'currency', 'language', 'themePreference', 'academicYear', 'status', 'createdAt', 'updatedAt'
+        ])
+        && data.id == orgId
+        && isValidId(data.id)
+        && isStrLen(data.name, 2, 120)
+        && data.type in ['independent_teacher', 'educational_center']
+        && isValidId(data.ownerId)
+        && isStrLen(data.ownerName, 2, 100)
+        && isStrLen(data.phone, 5, 30)
+        && isStrLen(data.email, 3, 200)
+        && isStrLen(data.city, 2, 80)
+        && (!('address' in data) || isStrLen(data.address, 0, 250))
+        && data.currency == 'EGP'
+        && data.language == 'ar'
+        && data.themePreference in ['light', 'dark', 'system']
+        && isStrLen(data.academicYear, 4, 30)
+        && data.status in ['active', 'suspended']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidOrganizationMember(data, orgId, memberUid) {
+      return data.keys().hasAll([
+          'uid', 'organizationId', 'displayName', 'email', 'role', 'status', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'uid', 'organizationId', 'displayName', 'email', 'role', 'status', 'invitedBy', 'createdAt', 'updatedAt'
+        ])
+        && data.uid == memberUid
+        && isValidId(data.uid)
+        && data.organizationId == orgId
+        && isValidId(data.organizationId)
+        && isStrLen(data.displayName, 1, 100)
+        && isStrLen(data.email, 3, 200)
+        && data.role in ['owner', 'teacher', 'assistant', 'accountant']
+        && data.status in ['active', 'invited', 'suspended']
+        && (!('invitedBy' in data) || isValidId(data.invitedBy))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidStudent(data, orgId, studentId) {
+      return data.keys().hasAll([
+          'id', 'organizationId', 'fullName', 'phone', 'gradeLevel', 'status', 'createdBy', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'organizationId', 'fullName', 'phone', 'guardianName', 'guardianPhone',
+          'gradeLevel', 'status', 'notes', 'createdBy', 'createdAt', 'updatedAt'
+        ])
+        && data.id == studentId
+        && isValidId(data.id)
+        && data.organizationId == orgId
+        && isStrLen(data.fullName, 2, 120)
+        && isStrLen(data.phone, 5, 30)
+        && (!('guardianName' in data) || isStrLen(data.guardianName, 0, 120))
+        && (!('guardianPhone' in data) || isStrLen(data.guardianPhone, 0, 30))
+        && isStrLen(data.gradeLevel, 1, 60)
+        && data.status in ['active', 'inactive', 'archived']
+        && (!('notes' in data) || isStrLen(data.notes, 0, 500))
+        && isValidId(data.createdBy)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidGroup(data, orgId, groupId) {
+      return data.keys().hasAll([
+          'id', 'organizationId', 'name', 'subject', 'gradeLevel', 'teacherId', 'teacherName',
+          'capacity', 'studentCount', 'monthlyFee', 'status', 'createdBy', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'organizationId', 'name', 'subject', 'gradeLevel', 'teacherId', 'teacherName',
+          'capacity', 'studentCount', 'scheduleSummary', 'monthlyFee', 'status', 'createdBy', 'createdAt', 'updatedAt'
+        ])
+        && data.id == groupId
+        && isValidId(data.id)
+        && data.organizationId == orgId
+        && isStrLen(data.name, 2, 120)
+        && isStrLen(data.subject, 1, 80)
+        && isStrLen(data.gradeLevel, 1, 60)
+        && isValidId(data.teacherId)
+        && isStrLen(data.teacherName, 1, 100)
+        && data.capacity is number && data.capacity >= 1 && data.capacity <= 500
+        && data.studentCount is number && data.studentCount >= 0 && data.studentCount <= 500
+        && (!('scheduleSummary' in data) || isStrLen(data.scheduleSummary, 0, 150))
+        && data.monthlyFee is number && data.monthlyFee >= 0
+        && data.status in ['active', 'paused', 'archived']
+        && isValidId(data.createdBy)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidSession(data, orgId, sessionId) {
+      return data.keys().hasAll([
+          'id', 'organizationId', 'groupId', 'groupName', 'teacherId', 'teacherName',
+          'title', 'date', 'startTime', 'endTime', 'status', 'createdBy', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'organizationId', 'groupId', 'groupName', 'teacherId', 'teacherName',
+          'title', 'date', 'startTime', 'endTime', 'room', 'status', 'createdBy', 'createdAt', 'updatedAt'
+        ])
+        && data.id == sessionId
+        && isValidId(data.id)
+        && data.organizationId == orgId
+        && isValidId(data.groupId)
+        && isStrLen(data.groupName, 1, 120)
+        && isValidId(data.teacherId)
+        && isStrLen(data.teacherName, 1, 100)
+        && isStrLen(data.title, 2, 150)
+        && data.date is string && data.date.size() == 10 && data.date.matches('^\\d{4}-\\d{2}-\\d{2}$')
+        && data.startTime is string && data.startTime.size() == 5 && data.startTime.matches('^\\d{2}:\\d{2}$')
+        && data.endTime is string && data.endTime.size() == 5 && data.endTime.matches('^\\d{2}:\\d{2}$')
+        && (!('room' in data) || isStrLen(data.room, 0, 80))
+        && data.status in ['scheduled', 'completed', 'cancelled']
+        && isValidId(data.createdBy)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidAttendance(data, orgId, attendanceId) {
+      return data.keys().hasAll([
+          'id', 'organizationId', 'sessionId', 'studentId', 'studentName', 'groupId',
+          'status', 'recordedBy', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'organizationId', 'sessionId', 'studentId', 'studentName', 'groupId',
+          'status', 'note', 'recordedBy', 'createdAt', 'updatedAt'
+        ])
+        && data.id == attendanceId
+        && isValidId(data.id)
+        && data.organizationId == orgId
+        && isValidId(data.sessionId)
+        && isValidId(data.studentId)
+        && isStrLen(data.studentName, 1, 120)
+        && isValidId(data.groupId)
+        && data.status in ['present', 'absent', 'late', 'excused']
+        && (!('note' in data) || isStrLen(data.note, 0, 300))
+        && isValidId(data.recordedBy)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidPayment(data, orgId, paymentId) {
+      return data.keys().hasAll([
+          'id', 'organizationId', 'studentId', 'studentName', 'amount', 'paidAmount', 'dueAmount',
+          'currency', 'category', 'method', 'status', 'recordedBy', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'organizationId', 'studentId', 'studentName', 'groupId', 'amount', 'paidAmount', 'dueAmount',
+          'currency', 'category', 'method', 'status', 'referenceNumber', 'notes', 'recordedBy', 'createdAt', 'updatedAt'
+        ])
+        && data.id == paymentId
+        && isValidId(data.id)
+        && data.organizationId == orgId
+        && isValidId(data.studentId)
+        && isStrLen(data.studentName, 1, 120)
+        && (!('groupId' in data) || isStrLen(data.groupId, 0, 128))
+        && data.amount is number && data.amount > 0
+        && data.paidAmount is number && data.paidAmount >= 0
+        && data.dueAmount is number && data.dueAmount >= 0
+        && data.currency == 'EGP'
+        && data.category in ['tuition', 'materials', 'registration', 'other']
+        && data.method in ['cash', 'vodafone_cash', 'instapay', 'bank_transfer', 'card']
+        && data.status in ['posted', 'partial', 'pending', 'voided']
+        && (!('referenceNumber' in data) || isStrLen(data.referenceNumber, 0, 80))
+        && (!('notes' in data) || isStrLen(data.notes, 0, 300))
+        && isValidId(data.recordedBy)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidExpense(data, orgId, expenseId) {
+      return data.keys().hasAll([
+          'id', 'organizationId', 'title', 'category', 'amount', 'currency',
+          'status', 'expenseDate', 'recordedBy', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'organizationId', 'title', 'category', 'amount', 'currency',
+          'status', 'expenseDate', 'notes', 'recordedBy', 'createdAt', 'updatedAt'
+        ])
+        && data.id == expenseId
+        && isValidId(data.id)
+        && data.organizationId == orgId
+        && isStrLen(data.title, 2, 150)
+        && data.category in ['rent', 'salaries', 'utilities', 'printing', 'marketing', 'other']
+        && data.amount is number && data.amount > 0
+        && data.currency == 'EGP'
+        && data.status in ['posted', 'voided']
+        && data.expenseDate is string && data.expenseDate.size() == 10 && data.expenseDate.matches('^\\d{4}-\\d{2}-\\d{2}$')
+        && (!('notes' in data) || isStrLen(data.notes, 0, 300))
+        && isValidId(data.recordedBy)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidAuditLog(data, orgId, logId) {
+      return data.keys().hasAll([
+          'id', 'organizationId', 'actorId', 'actorName', 'actorRole',
+          'action', 'entityType', 'entityId', 'summary', 'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'organizationId', 'actorId', 'actorName', 'actorRole',
+          'action', 'entityType', 'entityId', 'summary', 'createdAt'
+        ])
+        && data.id == logId
+        && isValidId(data.id)
+        && data.organizationId == orgId
+        && data.actorId == request.auth.uid
+        && isStrLen(data.actorName, 1, 100)
+        && data.actorRole in ['owner', 'teacher', 'assistant', 'accountant']
+        && isStrLen(data.action, 2, 100)
+        && isStrLen(data.entityType, 2, 60)
+        && isValidId(data.entityId)
+        && isStrLen(data.summary, 2, 300)
+        && data.createdAt is timestamp;
+    }
+
+    function isValidInvitation(data, orgId, invitationId) {
+      return data.keys().hasAll([
+          'id', 'organizationId', 'email', 'role', 'invitedBy', 'invitedByName', 'status', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'organizationId', 'email', 'role', 'invitedBy', 'invitedByName', 'status', 'createdAt', 'updatedAt'
+        ])
+        && data.id == invitationId
+        && isValidId(data.id)
+        && data.organizationId == orgId
+        && isStrLen(data.email, 3, 200)
+        && data.role in ['teacher', 'assistant', 'accountant']
+        && isValidId(data.invitedBy)
+        && isStrLen(data.invitedByName, 1, 100)
+        && data.status in ['pending', 'accepted', 'revoked']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // =========================================================================
+    // Users Collection (PII strictly owner-only)
+    // =========================================================================
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && request.auth.uid == userId;
+      allow list: if false;
+
+      allow create: if isSignedIn()
+        && isValidId(userId)
+        && request.auth.uid == userId
+        && isValidUserProfile(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isSignedIn()
+        && isValidId(userId)
+        && request.auth.uid == userId
+        && isValidUserProfile(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'displayName', 'phone', 'themePreference', 'activeOrganizationId', 'organizationIds', 'updatedAt'
+        ]);
+
+      allow delete: if false;
+    }
+
+    // =========================================================================
+    // Organizations Multi-Tenant Root
+    // =========================================================================
+    match /organizations/{organizationId} {
+      allow get: if isValidId(organizationId) && isActiveMember(organizationId);
+      allow list: if false;
+
+      allow create: if isVerifiedUser()
+        && isValidId(organizationId)
+        && isValidOrganization(incoming(), organizationId)
+        && incoming().ownerId == request.auth.uid
+        && incoming().status == 'active'
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && existsAfter(/databases/$(database)/documents/organizations/$(organizationId)/members/$(request.auth.uid));
+
+      allow update: if isValidId(organizationId)
+        && isValidOrganization(incoming(), organizationId)
+        && isOrgOwner(organizationId)
+        && incoming().id == existing().id
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'name', 'ownerName', 'phone', 'email', 'city', 'address', 'themePreference', 'academicYear', 'updatedAt'
+        ]);
+
+      allow delete: if false;
+
+      // -----------------------------------------------------------------------
+      // Organization Members (Source of Truth for Tenant RBAC)
+      // -----------------------------------------------------------------------
+      match /members/{userId} {
+        allow get: if isValidId(organizationId) && isValidId(userId) && (
+          (isVerifiedUser() && request.auth.uid == userId)
+          || isActiveMember(organizationId)
+        );
+        allow list: if isActiveMember(organizationId) && resource.data.organizationId == organizationId;
+
+        allow create: if isVerifiedUser()
+          && isValidId(organizationId)
+          && isValidId(userId)
+          && isValidOrganizationMember(incoming(), organizationId, userId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && (
+            (
+              userId == request.auth.uid
+              && incoming().role == 'owner'
+              && incoming().status == 'active'
+              && !exists(/databases/$(database)/documents/organizations/$(organizationId))
+              && getAfter(/databases/$(database)/documents/organizations/$(organizationId)).data.ownerId == request.auth.uid
+            )
+            ||
+            (
+              isOrgOwner(organizationId)
+              && incoming().role != 'owner'
+            )
+          );
+
+        allow update: if isValidId(organizationId)
+          && isValidId(userId)
+          && isValidOrganizationMember(incoming(), organizationId, userId)
+          && isOrgOwner(organizationId)
+          && incoming().uid == existing().uid
+          && incoming().organizationId == existing().organizationId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            (userId != request.auth.uid && incoming().role != 'owner' && incoming().diff(existing()).affectedKeys().hasOnly(['role', 'status', 'displayName', 'updatedAt']))
+            ||
+            (userId == request.auth.uid && incoming().role == existing().role && incoming().status == existing().status && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'updatedAt']))
+          );
+
+        allow delete: if isValidId(organizationId)
+          && isValidId(userId)
+          && isOrgOwner(organizationId)
+          && userId != request.auth.uid;
+      }
+
+      // -----------------------------------------------------------------------
+      // Students
+      // -----------------------------------------------------------------------
+      match /students/{studentId} {
+        allow get: if isValidId(organizationId) && isValidId(studentId) && isActiveMember(organizationId);
+        allow list: if isActiveMember(organizationId) && resource.data.organizationId == organizationId;
+
+        allow create: if isValidId(organizationId)
+          && isValidId(studentId)
+          && hasAnyRole(organizationId, ['owner', 'teacher', 'assistant'])
+          && isValidStudent(incoming(), organizationId, studentId)
+          && incoming().createdBy == request.auth.uid
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+
+        allow update: if isValidId(organizationId)
+          && isValidId(studentId)
+          && isValidStudent(incoming(), organizationId, studentId)
+          && hasAnyRole(organizationId, ['owner', 'teacher', 'assistant'])
+          && incoming().id == existing().id
+          && incoming().organizationId == existing().organizationId
+          && incoming().createdBy == existing().createdBy
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'fullName', 'phone', 'guardianName', 'guardianPhone', 'gradeLevel', 'status', 'notes', 'updatedAt'
+          ]);
+
+        allow delete: if isValidId(organizationId) && isValidId(studentId) && isOrgOwner(organizationId);
+      }
+
+      // -----------------------------------------------------------------------
+      // Groups
+      // -----------------------------------------------------------------------
+      match /groups/{groupId} {
+        allow get: if isValidId(organizationId) && isValidId(groupId) && isActiveMember(organizationId);
+        allow list: if isActiveMember(organizationId) && resource.data.organizationId == organizationId;
+
+        allow create: if isValidId(organizationId)
+          && isValidId(groupId)
+          && hasAnyRole(organizationId, ['owner', 'teacher', 'assistant'])
+          && isValidGroup(incoming(), organizationId, groupId)
+          && incoming().createdBy == request.auth.uid
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+
+        allow update: if isValidId(organizationId)
+          && isValidId(groupId)
+          && isValidGroup(incoming(), organizationId, groupId)
+          && hasAnyRole(organizationId, ['owner', 'teacher', 'assistant'])
+          && incoming().id == existing().id
+          && incoming().organizationId == existing().organizationId
+          && incoming().createdBy == existing().createdBy
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'name', 'subject', 'gradeLevel', 'teacherId', 'teacherName', 'capacity',
+            'studentCount', 'scheduleSummary', 'monthlyFee', 'status', 'updatedAt'
+          ]);
+
+        allow delete: if isValidId(organizationId) && isValidId(groupId) && isOrgOwner(organizationId);
+      }
+
+      // -----------------------------------------------------------------------
+      // Sessions
+      // -----------------------------------------------------------------------
+      match /sessions/{sessionId} {
+        allow get: if isValidId(organizationId) && isValidId(sessionId) && isActiveMember(organizationId);
+        allow list: if isActiveMember(organizationId) && resource.data.organizationId == organizationId;
+
+        allow create: if isValidId(organizationId)
+          && isValidId(sessionId)
+          && hasAnyRole(organizationId, ['owner', 'teacher', 'assistant'])
+          && isValidSession(incoming(), organizationId, sessionId)
+          && incoming().createdBy == request.auth.uid
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+
+        allow update: if isValidId(organizationId)
+          && isValidId(sessionId)
+          && isValidSession(incoming(), organizationId, sessionId)
+          && hasAnyRole(organizationId, ['owner', 'teacher', 'assistant'])
+          && existing().status != 'cancelled'
+          && incoming().id == existing().id
+          && incoming().organizationId == existing().organizationId
+          && incoming().createdBy == existing().createdBy
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'title', 'date', 'startTime', 'endTime', 'room', 'status', 'teacherId', 'teacherName', 'updatedAt'
+          ]);
+
+        allow delete: if isValidId(organizationId) && isValidId(sessionId) && isOrgOwner(organizationId);
+      }
+
+      // -----------------------------------------------------------------------
+      // Attendance
+      // -----------------------------------------------------------------------
+      match /attendance/{attendanceId} {
+        allow get: if isValidId(organizationId) && isValidId(attendanceId) && isActiveMember(organizationId);
+        allow list: if isActiveMember(organizationId) && resource.data.organizationId == organizationId;
+
+        allow create: if isValidId(organizationId)
+          && isValidId(attendanceId)
+          && hasAnyRole(organizationId, ['owner', 'teacher', 'assistant'])
+          && isValidAttendance(incoming(), organizationId, attendanceId)
+          && incoming().recordedBy == request.auth.uid
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+
+        allow update: if isValidId(organizationId)
+          && isValidId(attendanceId)
+          && isValidAttendance(incoming(), organizationId, attendanceId)
+          && hasAnyRole(organizationId, ['owner', 'teacher', 'assistant'])
+          && incoming().id == existing().id
+          && incoming().organizationId == existing().organizationId
+          && incoming().sessionId == existing().sessionId
+          && incoming().studentId == existing().studentId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'status', 'note', 'recordedBy', 'updatedAt'
+          ]);
+
+        allow delete: if false;
+      }
+
+      // -----------------------------------------------------------------------
+      // Payments (Auditable, never permanently deleted, terminal lock on voided)
+      // -----------------------------------------------------------------------
+      match /payments/{paymentId} {
+        allow get: if isValidId(organizationId) && isValidId(paymentId) && hasAnyRole(organizationId, ['owner', 'accountant', 'assistant']);
+        allow list: if hasAnyRole(organizationId, ['owner', 'accountant', 'assistant']) && resource.data.organizationId == organizationId;
+
+        allow create: if isValidId(organizationId)
+          && isValidId(paymentId)
+          && hasAnyRole(organizationId, ['owner', 'accountant', 'assistant'])
+          && isValidPayment(incoming(), organizationId, paymentId)
+          && incoming().status != 'voided'
+          && incoming().recordedBy == request.auth.uid
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+
+        allow update: if isValidId(organizationId)
+          && isValidId(paymentId)
+          && isValidPayment(incoming(), organizationId, paymentId)
+          && hasAnyRole(organizationId, ['owner', 'accountant'])
+          && existing().status != 'voided'
+          && incoming().id == existing().id
+          && incoming().organizationId == existing().organizationId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            (incoming().status in ['posted', 'partial'] && incoming().diff(existing()).affectedKeys().hasOnly(['paidAmount', 'dueAmount', 'status', 'method', 'referenceNumber', 'notes', 'updatedAt']))
+            ||
+            (incoming().status == 'voided' && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'notes', 'updatedAt']))
+          );
+
+        allow delete: if false;
+      }
+
+      // -----------------------------------------------------------------------
+      // Expenses (Auditable, never permanently deleted, terminal lock on voided)
+      // -----------------------------------------------------------------------
+      match /expenses/{expenseId} {
+        allow get: if isValidId(organizationId) && isValidId(expenseId) && hasAnyRole(organizationId, ['owner', 'accountant']);
+        allow list: if hasAnyRole(organizationId, ['owner', 'accountant']) && resource.data.organizationId == organizationId;
+
+        allow create: if isValidId(organizationId)
+          && isValidId(expenseId)
+          && hasAnyRole(organizationId, ['owner', 'accountant'])
+          && isValidExpense(incoming(), organizationId, expenseId)
+          && incoming().status == 'posted'
+          && incoming().recordedBy == request.auth.uid
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+
+        allow update: if isValidId(organizationId)
+          && isValidId(expenseId)
+          && isValidExpense(incoming(), organizationId, expenseId)
+          && hasAnyRole(organizationId, ['owner', 'accountant'])
+          && existing().status != 'voided'
+          && incoming().status == 'voided'
+          && incoming().id == existing().id
+          && incoming().organizationId == existing().organizationId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'notes', 'updatedAt']);
+
+        allow delete: if false;
+      }
+
+      // -----------------------------------------------------------------------
+      // Audit Logs (Append-only)
+      // -----------------------------------------------------------------------
+      match /auditLogs/{logId} {
+        allow get: if isValidId(organizationId) && isValidId(logId) && hasAnyRole(organizationId, ['owner', 'accountant']);
+        allow list: if hasAnyRole(organizationId, ['owner', 'accountant']) && resource.data.organizationId == organizationId;
+
+        allow create: if isValidId(organizationId)
+          && isValidId(logId)
+          && isActiveMember(organizationId)
+          && isValidAuditLog(incoming(), organizationId, logId)
+          && incoming().createdAt == request.time;
+
+        allow update: if false;
+        allow delete: if false;
+      }
+
+      // -----------------------------------------------------------------------
+      // Staff Invitations
+      // -----------------------------------------------------------------------
+      match /invitations/{invitationId} {
+        allow get: if isValidId(organizationId) && isValidId(invitationId) && isOrgOwner(organizationId);
+        allow list: if isOrgOwner(organizationId) && resource.data.organizationId == organizationId;
+
+        allow create: if isValidId(organizationId)
+          && isValidId(invitationId)
+          && isOrgOwner(organizationId)
+          && isValidInvitation(incoming(), organizationId, invitationId)
+          && incoming().invitedBy == request.auth.uid
+          && incoming().status == 'pending'
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+
+        allow update: if isValidId(organizationId)
+          && isValidId(invitationId)
+          && isOrgOwner(organizationId)
+          && isValidInvitation(incoming(), organizationId, invitationId)
+          && existing().status == 'pending'
+          && incoming().status in ['accepted', 'revoked']
+          && incoming().id == existing().id
+          && incoming().organizationId == existing().organizationId
+          && incoming().invitedBy == existing().invitedBy
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']);
+
+        allow delete: if isValidId(organizationId) && isValidId(invitationId) && isOrgOwner(organizationId);
+      }
+    }
+  }
+}

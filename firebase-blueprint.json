@@ -125,6 +125,10 @@
           "type": "string",
           "enum": ["active", "suspended"]
         },
+        "totalStudentsCount": { "type": "integer" },
+        "activeStudentsCount": { "type": "integer" },
+        "inactiveStudentsCount": { "type": "integer" },
+        "archivedStudentsCount": { "type": "integer" },
         "createdAt": {
           "type": "string",
           "format": "date-time"
@@ -322,6 +326,11 @@
         "studentCount": {
           "type": "number"
         },
+        "lastEnrollmentId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
         "scheduleSummary": {
           "type": "string",
           "minLength": 0,
@@ -364,6 +373,30 @@
         "createdBy",
         "createdAt",
         "updatedAt"
+      ]
+    },
+    "GroupEnrollment": {
+      "title": "GroupEnrollment",
+      "description": "Deterministic student enrollment linking a student to a study group.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "organizationId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "groupId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "studentId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "studentName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "groupName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "status": { "type": "string", "enum": ["active", "removed"] },
+        "enrolledBy": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "removedBy": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "enrolledAt": { "type": "string", "format": "date-time" },
+        "removedAt": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id", "organizationId", "groupId", "studentId", "studentName", "groupName",
+        "status", "enrolledBy", "enrolledAt", "createdAt", "updatedAt"
       ]
     },
     "ClassSession": {
@@ -436,6 +469,14 @@
         "status": {
           "type": "string",
           "enum": ["scheduled", "completed", "cancelled"]
+        },
+        "cancellationReason": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 200
+        },
+        "rescheduleHistory": {
+          "type": "array"
         },
         "createdBy": {
           "type": "string",
@@ -588,6 +629,15 @@
         "dueAmount": {
           "type": "number"
         },
+        "amountPiasters": {
+          "type": "integer"
+        },
+        "paidAmountPiasters": {
+          "type": "integer"
+        },
+        "dueAmountPiasters": {
+          "type": "integer"
+        },
         "currency": {
           "type": "string",
           "enum": ["EGP"]
@@ -604,16 +654,27 @@
           "type": "string",
           "enum": ["posted", "partial", "pending", "voided"]
         },
+        "paymentDate": {
+          "type": "string"
+        },
         "referenceNumber": {
           "type": "string",
           "minLength": 0,
           "maxLength": 80
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
         },
         "notes": {
           "type": "string",
           "minLength": 0,
           "maxLength": 300
         },
+        "voidReason": { "type": "string", "minLength": 3, "maxLength": 200 },
+        "voidedBy": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "voidedAt": { "type": "string", "format": "date-time" },
         "recordedBy": {
           "type": "string",
           "minLength": 1,
@@ -675,6 +736,9 @@
         "amount": {
           "type": "number"
         },
+        "amountPiasters": {
+          "type": "integer"
+        },
         "currency": {
           "type": "string",
           "enum": ["EGP"]
@@ -689,11 +753,15 @@
           "maxLength": 10,
           "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
         },
+        "idempotencyKey": { "type": "string", "minLength": 1, "maxLength": 128 },
         "notes": {
           "type": "string",
           "minLength": 0,
           "maxLength": 300
         },
+        "voidReason": { "type": "string", "minLength": 3, "maxLength": 200 },
+        "voidedBy": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "voidedAt": { "type": "string", "format": "date-time" },
         "recordedBy": {
           "type": "string",
           "minLength": 1,
@@ -721,6 +789,34 @@
         "recordedBy",
         "createdAt",
         "updatedAt"
+      ]
+    },
+    "LedgerEntry": {
+      "title": "LedgerEntry",
+      "description": "Immutable financial ledger entry in integer piasters.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "organizationId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "entryType": { "type": "string", "enum": ["charge", "payment", "reversal", "adjustment"] },
+        "direction": { "type": "string", "enum": ["debit", "credit"] },
+        "entityType": { "type": "string", "enum": ["payment", "expense"] },
+        "entityId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "studentId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "studentName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "groupId": { "type": "string", "minLength": 0, "maxLength": 128 },
+        "amountPiasters": { "type": "integer" },
+        "amount": { "type": "number" },
+        "currency": { "type": "string", "enum": ["EGP"] },
+        "description": { "type": "string", "minLength": 2, "maxLength": 300 },
+        "relatedEntryId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "idempotencyKey": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "recordedBy": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id", "organizationId", "entryType", "direction", "entityType", "entityId",
+        "amountPiasters", "amount", "currency", "description", "recordedBy", "createdAt"
       ]
     },
     "AuditLog": {
@@ -775,6 +871,18 @@
           "type": "string",
           "minLength": 2,
           "maxLength": 300
+        },
+        "result": {
+          "type": "string",
+          "enum": ["success", "denied", "failure"]
+        },
+        "correlationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "metadata": {
+          "type": "object"
         },
         "createdAt": {
           "type": "string",
@@ -879,6 +987,10 @@
       "schema": { "$ref": "#/entities/StudyGroup" },
       "description": "Academic groups within the organization."
     },
+    "/organizations/{organizationId}/enrollments/{enrollmentId}": {
+      "schema": { "$ref": "#/entities/GroupEnrollment" },
+      "description": "Deterministic student-group enrollment records."
+    },
     "/organizations/{organizationId}/sessions/{sessionId}": {
       "schema": { "$ref": "#/entities/ClassSession" },
       "description": "Scheduled class sessions within the organization."
@@ -894,6 +1006,10 @@
     "/organizations/{organizationId}/expenses/{expenseId}": {
       "schema": { "$ref": "#/entities/ExpenseRecord" },
       "description": "Auditable operational expense records in EGP."
+    },
+    "/organizations/{organizationId}/ledgerEntries/{entryId}": {
+      "schema": { "$ref": "#/entities/LedgerEntry" },
+      "description": "Immutable financial ledger entries in integer piasters."
     },
     "/organizations/{organizationId}/auditLogs/{logId}": {
       "schema": { "$ref": "#/entities/AuditLog" },

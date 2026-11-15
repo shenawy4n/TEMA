@@ -12,6 +12,7 @@ export interface VerifiedUser {
 export interface VerifiedMembership {
   uid: string;
   organizationId: string;
+  displayName?: string;
   role: MemberRole;
   status: 'active' | 'invited' | 'suspended';
 }
@@ -70,6 +71,7 @@ interface FirestoreRestDoc {
   fields?: {
     uid?: FirestoreStringField;
     organizationId?: FirestoreStringField;
+    displayName?: FirestoreStringField;
     role?: FirestoreStringField;
     status?: FirestoreStringField;
   };
@@ -84,30 +86,47 @@ export async function verifyActiveOrganizationMembership(
 ): Promise<{ ok: true; membership: VerifiedMembership } | { ok: false; status: number; error: string }> {
   const projectId = firebaseConfig.projectId;
   const databaseId = firebaseConfig.firestoreDatabaseId || '(default)';
-  const endpoint =
+  const baseUrl =
     `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(projectId)}` +
-    `/databases/${encodeURIComponent(databaseId)}/documents/organizations/${encodeURIComponent(organizationId)}/members/${encodeURIComponent(uid)}`;
+    `/databases/${encodeURIComponent(databaseId)}/documents/organizations/${encodeURIComponent(organizationId)}`;
+  const orgEndpoint = baseUrl;
+  const memberEndpoint = `${baseUrl}/members/${encodeURIComponent(uid)}`;
 
   try {
-    const response = await fetch(endpoint, {
-      method: 'GET',
-      headers: {
-        Authorization: `Bearer ${idToken}`,
-      },
-    });
+    const [orgRes, memberRes] = await Promise.all([
+      fetch(orgEndpoint, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${idToken}` },
+      }),
+      fetch(memberEndpoint, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${idToken}` },
+      }),
+    ]);
 
-    if (response.status === 403 || response.status === 404) {
+    if (
+      orgRes.status === 403 ||
+      orgRes.status === 404 ||
+      memberRes.status === 403 ||
+      memberRes.status === 404
+    ) {
       return { ok: false, status: 403, error: 'Active organization membership is required.' };
     }
-    if (!response.ok) {
+    if (!orgRes.ok || !memberRes.ok) {
       return { ok: false, status: 503, error: 'Unable to verify organization membership.' };
     }
 
-    const doc = (await response.json()) as FirestoreRestDoc;
+    const orgDoc = (await orgRes.json()) as FirestoreRestDoc;
+    if (orgDoc.fields?.status?.stringValue !== 'active') {
+      return { ok: false, status: 403, error: 'Organization is suspended or inactive.' };
+    }
+
+    const doc = (await memberRes.json()) as FirestoreRestDoc;
     const role = doc.fields?.role?.stringValue as MemberRole | undefined;
     const status = doc.fields?.status?.stringValue;
     const docOrgId = doc.fields?.organizationId?.stringValue;
     const docUid = doc.fields?.uid?.stringValue;
+    const displayName = doc.fields?.displayName?.stringValue || 'مستخدم TEMA';
 
     if (
       docUid !== uid ||
@@ -124,6 +143,7 @@ export async function verifyActiveOrganizationMembership(
       membership: {
         uid,
         organizationId,
+        displayName,
         role,
         status: 'active',
       },

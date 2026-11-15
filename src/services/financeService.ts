@@ -1,15 +1,41 @@
-import { collection, doc, getDocs, query, serverTimestamp, where, writeBatch } from 'firebase/firestore';
+import {
+  collection,
+  doc,
+  getDocs,
+  query,
+  runTransaction,
+  serverTimestamp,
+  where,
+} from 'firebase/firestore';
 import { db } from '@/src/lib/firebase/config';
 import { handleFirestoreError, OperationType } from '@/src/lib/firebase/errors';
-import { sanitizeText } from '@/src/lib/firebase/validation';
-import { generateId } from '@/src/lib/utils/format';
+import { isValidEntityId, sanitizeText } from '@/src/lib/firebase/validation';
+import { generateId, getTodayIsoDate } from '@/src/lib/utils/format';
+import {
+  DomainValidationError,
+  egpToPiasters,
+  piastersToEgp,
+  resolveRecordPiasters,
+} from '@/src/lib/domain/money';
+import {
+  validateCreateExpenseInput,
+  validateCreatePaymentInput,
+  validateSettlementAgainstPayment,
+} from '@/src/lib/domain/ledger';
 import { enqueueAuditLog, type AuditActor } from './auditService';
+import {
+  resolveActiveOrganizationInTx,
+  resolveAuthorizedMemberInTx,
+} from './tenantAuthority';
 import type {
   ExpenseCategory,
   ExpenseRecord,
+  GroupEnrollment,
+  LedgerEntry,
   PaymentCategory,
   PaymentMethod,
   PaymentRecord,
+  Student,
 } from '@/src/types/domain';
 
 export interface CreatePaymentInput {
@@ -20,8 +46,10 @@ export interface CreatePaymentInput {
   paidAmount: number;
   category: PaymentCategory;
   method: PaymentMethod;
+  paymentDate?: string;
   referenceNumber?: string;
   notes?: string;
+  idempotencyKey?: string;
 }
 
 export interface CreateExpenseInput {
@@ -30,6 +58,7 @@ export interface CreateExpenseInput {
   amount: number;
   expenseDate: string;
   notes?: string;
+  idempotencyKey?: string;
 }
 
 export async function listPayments(organizationId: string): Promise<PaymentRecord[]> {
@@ -64,54 +93,366 @@ export async function listPaymentsByStudent(
   }
 }
 
+export async function listLedgerEntries(organizationId: string): Promise<LedgerEntry[]> {
+  const path = `organizations/${organizationId}/ledgerEntries`;
+  try {
+    const q = query(
+      collection(db, 'organizations', organizationId, 'ledgerEntries'),
+      where('organizationId', '==', organizationId)
+    );
+    const snap = await getDocs(q);
+    return snap.docs.map((d) => d.data() as LedgerEntry);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.LIST, path);
+  }
+}
+
+export async function listLedgerEntriesByStudent(
+  organizationId: string,
+  studentId: string
+): Promise<LedgerEntry[]> {
+  const path = `organizations/${organizationId}/ledgerEntries`;
+  try {
+    const q = query(
+      collection(db, 'organizations', organizationId, 'ledgerEntries'),
+      where('organizationId', '==', organizationId),
+      where('studentId', '==', studentId)
+    );
+    const snap = await getDocs(q);
+    return snap.docs.map((d) => d.data() as LedgerEntry);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.LIST, path);
+  }
+}
+
 export async function createPayment(
   organizationId: string,
   input: CreatePaymentInput,
-  actor: AuditActor
+  _actor?: AuditActor
 ): Promise<string> {
-  const paymentId = generateId('pay');
-  const path = `organizations/${organizationId}/payments/${paymentId}`;
-  const batch = writeBatch(db);
-
-  const amount = Math.max(1, Number(input.amount));
-  const paidAmount = Math.max(0, Math.min(amount, Number(input.paidAmount)));
-  const dueAmount = Math.max(0, amount - paidAmount);
-  const status = dueAmount === 0 ? 'posted' : paidAmount > 0 ? 'partial' : 'pending';
-  const studentName = sanitizeText(input.studentName, 120);
-
-  batch.set(doc(db, 'organizations', organizationId, 'payments', paymentId), {
-    id: paymentId,
-    organizationId,
-    studentId: input.studentId,
-    studentName,
-    groupId: input.groupId || '',
-    amount,
-    paidAmount,
-    dueAmount,
-    currency: 'EGP',
-    category: input.category,
-    method: input.method,
-    status,
-    referenceNumber: sanitizeText(input.referenceNumber || '', 80),
-    notes: sanitizeText(input.notes || '', 300),
-    recordedBy: actor.uid,
-    createdAt: serverTimestamp(),
-    updatedAt: serverTimestamp(),
-  });
-
-  enqueueAuditLog(
-    batch,
-    organizationId,
-    actor,
-    'payment.created',
-    'payment',
-    paymentId,
-    `تسجيل عملية مالية للطالب "${studentName}" بقيمة ${amount} ج.م (محصّل: ${paidAmount} ج.م).`
-  );
+  const generatedPaymentId = generateId('pay');
+  const path = `organizations/${organizationId}/payments/${generatedPaymentId}`;
 
   try {
-    await batch.commit();
-    return paymentId;
+    return await runTransaction(db, async (tx) => {
+      const verifiedMember = await resolveAuthorizedMemberInTx(tx, organizationId, 'payments:create');
+      const org = await resolveActiveOrganizationInTx(tx, organizationId);
+
+      const validated = validateCreatePaymentInput(org, input, getTodayIsoDate());
+
+      // Check idempotency key inside transaction to prevent duplicate billing
+      if (validated.idempotencyKey) {
+        const keyDocId = `pay_${validated.idempotencyKey}`;
+        const keyRef = doc(db, 'organizations', organizationId, 'idempotencyKeys', keyDocId);
+        const keySnap = await tx.get(keyRef);
+        if (keySnap.exists()) {
+          const existing = keySnap.data() as { entityId?: string };
+          if (existing.entityId) {
+            return existing.entityId;
+          }
+        }
+      }
+
+      const studentRef = doc(db, 'organizations', organizationId, 'students', validated.studentId);
+      const studentSnap = await tx.get(studentRef);
+      if (!studentSnap.exists()) {
+        throw new DomainValidationError('الطالب المحدد غير موجود في المنظمة.', 'STUDENT_NOT_FOUND', 404);
+      }
+      const student = studentSnap.data() as Student;
+      if (student.status === 'archived') {
+        throw new DomainValidationError('لا يمكن إنشاء فاتورة جديدة لطالب مؤرشف.', 'STUDENT_ARCHIVED', 409);
+      }
+
+      if (validated.groupId) {
+        const groupRef = doc(db, 'organizations', organizationId, 'groups', validated.groupId);
+        const enrollmentRef = doc(
+          db,
+          'organizations',
+          organizationId,
+          'enrollments',
+          `${validated.groupId}_${validated.studentId}`
+        );
+        const [groupSnap, enrSnap] = await Promise.all([tx.get(groupRef), tx.get(enrollmentRef)]);
+        if (!groupSnap.exists()) {
+          throw new DomainValidationError('المجموعة المحددة غير موجودة في المنظمة.', 'GROUP_NOT_FOUND', 404);
+        }
+        const enr = enrSnap.exists() ? (enrSnap.data() as GroupEnrollment) : null;
+        if (!enr || enr.status !== 'active') {
+          throw new DomainValidationError(
+            'الطالب غير مسجل في المجموعة المحددة لهذه الدفعة.',
+            'STUDENT_NOT_ENROLLED_IN_GROUP',
+            409
+          );
+        }
+      }
+
+      const paymentRef = doc(db, 'organizations', organizationId, 'payments', generatedPaymentId);
+      const paymentPayload: Record<string, unknown> = {
+        id: generatedPaymentId,
+        organizationId,
+        studentId: student.id,
+        studentName: student.fullName,
+        groupId: validated.groupId,
+        amount: validated.amount,
+        paidAmount: validated.paidAmount,
+        dueAmount: validated.dueAmount,
+        amountPiasters: validated.amountPiasters,
+        paidAmountPiasters: validated.paidAmountPiasters,
+        dueAmountPiasters: validated.dueAmountPiasters,
+        currency: 'EGP',
+        category: validated.category,
+        method: validated.method,
+        status: validated.status,
+        paymentDate: validated.paymentDate,
+        referenceNumber: validated.referenceNumber,
+        notes: validated.notes,
+        recordedBy: verifiedMember.uid,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      };
+      if (validated.idempotencyKey) {
+        paymentPayload.idempotencyKey = validated.idempotencyKey;
+      }
+
+      tx.set(paymentRef, paymentPayload);
+
+      // Immutable Ledger Entry 1: Charge (Debit receivable)
+      const chargeEntryId = generateId('ldg');
+      tx.set(doc(db, 'organizations', organizationId, 'ledgerEntries', chargeEntryId), {
+        id: chargeEntryId,
+        organizationId,
+        entryType: 'charge',
+        direction: 'debit',
+        entityType: 'payment',
+        entityId: generatedPaymentId,
+        studentId: student.id,
+        studentName: student.fullName,
+        groupId: validated.groupId,
+        amountPiasters: validated.amountPiasters,
+        amount: validated.amount,
+        currency: 'EGP',
+        description: `استحقاق مالي (${validated.category}) للطالب "${student.fullName}"`,
+        recordedBy: verifiedMember.uid,
+        createdAt: serverTimestamp(),
+      });
+
+      // Immutable Ledger Entry 2: Collected Payment (Credit receivable) if paid > 0
+      if (validated.paidAmountPiasters > 0) {
+        const payEntryId = generateId('ldg');
+        tx.set(doc(db, 'organizations', organizationId, 'ledgerEntries', payEntryId), {
+          id: payEntryId,
+          organizationId,
+          entryType: 'payment',
+          direction: 'credit',
+          entityType: 'payment',
+          entityId: generatedPaymentId,
+          studentId: student.id,
+          studentName: student.fullName,
+          groupId: validated.groupId,
+          amountPiasters: validated.paidAmountPiasters,
+          amount: validated.paidAmount,
+          currency: 'EGP',
+          description: `تحصيل دفعة (${validated.method}) للطالب "${student.fullName}"`,
+          relatedEntryId: chargeEntryId,
+          recordedBy: verifiedMember.uid,
+          createdAt: serverTimestamp(),
+        });
+      }
+
+      if (validated.idempotencyKey) {
+        const keyDocId = `pay_${validated.idempotencyKey}`;
+        tx.set(doc(db, 'organizations', organizationId, 'idempotencyKeys', keyDocId), {
+          id: keyDocId,
+          organizationId,
+          entityType: 'payment',
+          entityId: generatedPaymentId,
+          createdBy: verifiedMember.uid,
+          createdAt: serverTimestamp(),
+        });
+      }
+
+      enqueueAuditLog(tx, organizationId, verifiedMember, {
+        action: 'payment.created',
+        entityType: 'payment',
+        entityId: generatedPaymentId,
+        summary: `تسجيل عملية مالية للطالب "${student.fullName}" بقيمة ${validated.amount} ج.م (محصّل: ${validated.paidAmount} ج.م).`,
+        result: 'success',
+        metadata: {
+          after: {
+            studentId: student.id,
+            amountPiasters: validated.amountPiasters,
+            paidAmountPiasters: validated.paidAmountPiasters,
+            dueAmountPiasters: validated.dueAmountPiasters,
+            status: validated.status,
+            method: validated.method,
+          },
+        },
+      });
+
+      return generatedPaymentId;
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, path);
+  }
+}
+
+export async function settlePaymentInstallment(
+  organizationId: string,
+  paymentId: string,
+  installmentAmountEgp: number,
+  method: PaymentMethod,
+  referenceNumber = ''
+): Promise<void> {
+  if (!isValidEntityId(paymentId)) {
+    throw new DomainValidationError('معرّف الدفعة غير صالح.', 'INVALID_PAYMENT_ID');
+  }
+  const path = `organizations/${organizationId}/payments/${paymentId}`;
+
+  try {
+    await runTransaction(db, async (tx) => {
+      const verifiedMember = await resolveAuthorizedMemberInTx(tx, organizationId, 'payments:settle');
+      await resolveActiveOrganizationInTx(tx, organizationId);
+
+      const payRef = doc(db, 'organizations', organizationId, 'payments', paymentId);
+      const paySnap = await tx.get(payRef);
+      if (!paySnap.exists()) {
+        throw new DomainValidationError('القيد المالي غير موجود.', 'PAYMENT_NOT_FOUND', 404);
+      }
+
+      const existing = paySnap.data() as PaymentRecord;
+      const settlement = validateSettlementAgainstPayment(existing, installmentAmountEgp, method);
+
+      const totalPiasters = resolveRecordPiasters(existing.amountPiasters, existing.amount);
+      const settleUpdate: Record<string, unknown> = {
+        paidAmount: settlement.newPaidAmount,
+        dueAmount: settlement.newDueAmount,
+        paidAmountPiasters: settlement.newPaidPiasters,
+        dueAmountPiasters: settlement.newDuePiasters,
+        status: settlement.nextStatus,
+        method,
+        referenceNumber: sanitizeText(referenceNumber || existing.referenceNumber || '', 80),
+        updatedAt: serverTimestamp(),
+      };
+      if (typeof existing.amountPiasters !== 'number') {
+        settleUpdate.amountPiasters = totalPiasters;
+      }
+
+      tx.update(payRef, settleUpdate);
+
+      const entryId = generateId('ldg');
+      const installmentEgp = piastersToEgp(settlement.installmentPiasters);
+      tx.set(doc(db, 'organizations', organizationId, 'ledgerEntries', entryId), {
+        id: entryId,
+        organizationId,
+        entryType: 'payment',
+        direction: 'credit',
+        entityType: 'payment',
+        entityId: paymentId,
+        studentId: existing.studentId,
+        studentName: existing.studentName,
+        groupId: existing.groupId || '',
+        amountPiasters: settlement.installmentPiasters,
+        amount: installmentEgp,
+        currency: 'EGP',
+        description: `سداد قسط إضافي (${method}) للفاتورة ${paymentId}`,
+        recordedBy: verifiedMember.uid,
+        createdAt: serverTimestamp(),
+      });
+
+      enqueueAuditLog(tx, organizationId, verifiedMember, {
+        action: 'payment.settled',
+        entityType: 'payment',
+        entityId: paymentId,
+        summary: `سداد قسط بقيمة ${installmentEgp} ج.م للطالب "${existing.studentName}".`,
+        result: 'success',
+        metadata: {
+          before: {
+            paidAmount: existing.paidAmount,
+            dueAmount: existing.dueAmount,
+            status: existing.status,
+          },
+          after: {
+            paidAmount: settlement.newPaidAmount,
+            dueAmount: settlement.newDueAmount,
+            status: settlement.nextStatus,
+            installmentEgp,
+          },
+        },
+      });
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, path);
+  }
+}
+
+export async function createPaymentAdjustment(
+  organizationId: string,
+  paymentId: string,
+  adjustmentAmountEgp: number,
+  direction: 'debit' | 'credit',
+  reason: string
+): Promise<string> {
+  if (!isValidEntityId(paymentId)) {
+    throw new DomainValidationError('معرّف الدفعة غير صالح.', 'INVALID_PAYMENT_ID');
+  }
+  const cleanReason = sanitizeText(reason || '', 200);
+  if (cleanReason.length < 3) {
+    throw new DomainValidationError('يجب توضيح سبب التسوية المحاسبية.', 'ADJUSTMENT_REASON_REQUIRED');
+  }
+  const amountPiasters = egpToPiasters(adjustmentAmountEgp, {
+    allowZero: false,
+    fieldLabel: 'قيمة التسوية',
+  });
+  const amount = piastersToEgp(amountPiasters);
+  const entryId = generateId('ldg');
+  const path = `organizations/${organizationId}/ledgerEntries/${entryId}`;
+
+  try {
+    await runTransaction(db, async (tx) => {
+      const verifiedMember = await resolveAuthorizedMemberInTx(tx, organizationId, 'payments:adjust');
+      await resolveActiveOrganizationInTx(tx, organizationId);
+
+      const payRef = doc(db, 'organizations', organizationId, 'payments', paymentId);
+      const paySnap = await tx.get(payRef);
+      if (!paySnap.exists()) {
+        throw new DomainValidationError('القيد المالي غير موجود.', 'PAYMENT_NOT_FOUND', 404);
+      }
+      const payment = paySnap.data() as PaymentRecord;
+      if (payment.status === 'voided') {
+        throw new DomainValidationError('لا يمكن إضافة تسوية لقيد ملغى.', 'PAYMENT_VOIDED', 409);
+      }
+
+      tx.set(doc(db, 'organizations', organizationId, 'ledgerEntries', entryId), {
+        id: entryId,
+        organizationId,
+        entryType: 'adjustment',
+        direction,
+        entityType: 'payment',
+        entityId: paymentId,
+        studentId: payment.studentId,
+        studentName: payment.studentName,
+        groupId: payment.groupId || '',
+        amountPiasters,
+        amount,
+        currency: 'EGP',
+        description: `تسوية محاسبية (${direction}): ${cleanReason}`,
+        recordedBy: verifiedMember.uid,
+        createdAt: serverTimestamp(),
+      });
+
+      enqueueAuditLog(tx, organizationId, verifiedMember, {
+        action: 'payment.adjusted',
+        entityType: 'ledger_entry',
+        entityId: entryId,
+        summary: `تسوية محاسبية (${direction}) بقيمة ${amount} ج.م على القيد ${paymentId}.`,
+        result: 'success',
+        metadata: {
+          after: { paymentId, direction, amountPiasters, reason: cleanReason },
+        },
+      });
+    });
+
+    return entryId;
   } catch (error) {
     handleFirestoreError(error, OperationType.CREATE, path);
   }
@@ -121,29 +462,104 @@ export async function voidPayment(
   organizationId: string,
   paymentId: string,
   reason: string,
-  actor: AuditActor
+  _actor?: AuditActor
 ): Promise<void> {
+  if (!isValidEntityId(paymentId)) {
+    throw new DomainValidationError('معرّف الدفعة غير صالح.', 'INVALID_PAYMENT_ID');
+  }
+  const cleanReason = sanitizeText(reason || '', 200);
+  if (cleanReason.length < 3) {
+    throw new DomainValidationError('يجب إدخال سبب واضح لإلغاء القيد المالي.', 'VOID_REASON_REQUIRED');
+  }
+
   const path = `organizations/${organizationId}/payments/${paymentId}`;
-  const batch = writeBatch(db);
-
-  batch.update(doc(db, 'organizations', organizationId, 'payments', paymentId), {
-    status: 'voided',
-    notes: sanitizeText(reason, 300),
-    updatedAt: serverTimestamp(),
-  });
-
-  enqueueAuditLog(
-    batch,
-    organizationId,
-    actor,
-    'payment.voided',
-    'payment',
-    paymentId,
-    `تم إلغاء قيد الدفعة (${paymentId}) — السبب: ${sanitizeText(reason, 120)}.`
-  );
 
   try {
-    await batch.commit();
+    await runTransaction(db, async (tx) => {
+      const verifiedMember = await resolveAuthorizedMemberInTx(tx, organizationId, 'payments:reverse');
+      await resolveActiveOrganizationInTx(tx, organizationId);
+
+      const payRef = doc(db, 'organizations', organizationId, 'payments', paymentId);
+      const paySnap = await tx.get(payRef);
+      if (!paySnap.exists()) {
+        throw new DomainValidationError('القيد المالي غير موجود.', 'PAYMENT_NOT_FOUND', 404);
+      }
+      const existing = paySnap.data() as PaymentRecord;
+      if (existing.status === 'voided') {
+        throw new DomainValidationError('هذا القيد المالي ملغى بالفعل.', 'ALREADY_VOIDED', 409);
+      }
+
+      const totalPiasters = resolveRecordPiasters(existing.amountPiasters, existing.amount);
+      const paidPiasters = resolveRecordPiasters(existing.paidAmountPiasters, existing.paidAmount);
+      const duePiasters = Math.max(0, totalPiasters - paidPiasters);
+
+      // Keep original amount/paidAmount/dueAmount intact; mark status='voided' and record formal reversal ledger entries
+      const voidPayUpdate: Record<string, unknown> = {
+        status: 'voided',
+        voidReason: cleanReason,
+        voidedBy: verifiedMember.uid,
+        voidedAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      };
+      if (typeof existing.amountPiasters !== 'number') {
+        voidPayUpdate.amountPiasters = totalPiasters;
+        voidPayUpdate.paidAmountPiasters = paidPiasters;
+        voidPayUpdate.dueAmountPiasters = duePiasters;
+      }
+      tx.update(payRef, voidPayUpdate);
+
+      const chargeReversalId = generateId('ldg');
+      tx.set(doc(db, 'organizations', organizationId, 'ledgerEntries', chargeReversalId), {
+        id: chargeReversalId,
+        organizationId,
+        entryType: 'reversal',
+        direction: 'credit',
+        entityType: 'payment',
+        entityId: paymentId,
+        studentId: existing.studentId,
+        studentName: existing.studentName,
+        groupId: existing.groupId || '',
+        amountPiasters: totalPiasters,
+        amount: piastersToEgp(totalPiasters),
+        currency: 'EGP',
+        description: `عكس قيد الاستحقاق (${paymentId}): ${cleanReason}`,
+        recordedBy: verifiedMember.uid,
+        createdAt: serverTimestamp(),
+      });
+
+      if (paidPiasters > 0) {
+        const payReversalId = generateId('ldg');
+        tx.set(doc(db, 'organizations', organizationId, 'ledgerEntries', payReversalId), {
+          id: payReversalId,
+          organizationId,
+          entryType: 'reversal',
+          direction: 'debit',
+          entityType: 'payment',
+          entityId: paymentId,
+          studentId: existing.studentId,
+          studentName: existing.studentName,
+          groupId: existing.groupId || '',
+          amountPiasters: paidPiasters,
+          amount: piastersToEgp(paidPiasters),
+          currency: 'EGP',
+          description: `عكس تحصيل دفعة (${paymentId}): ${cleanReason}`,
+          recordedBy: verifiedMember.uid,
+          createdAt: serverTimestamp(),
+        });
+      }
+
+      enqueueAuditLog(tx, organizationId, verifiedMember, {
+        action: 'payment.voided',
+        entityType: 'payment',
+        entityId: paymentId,
+        summary: `تم عكس وإلغاء قيد الدفعة (${paymentId}) — السبب: ${cleanReason}.`,
+        result: 'success',
+        metadata: {
+          before: { status: existing.status, amount: existing.amount, paidAmount: existing.paidAmount },
+          after: { status: 'voided', voidReason: cleanReason },
+        },
+      });
+    });
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, path);
   }
@@ -166,42 +582,97 @@ export async function listExpenses(organizationId: string): Promise<ExpenseRecor
 export async function createExpense(
   organizationId: string,
   input: CreateExpenseInput,
-  actor: AuditActor
+  _actor?: AuditActor
 ): Promise<string> {
   const expenseId = generateId('exp');
   const path = `organizations/${organizationId}/expenses/${expenseId}`;
-  const batch = writeBatch(db);
-  const title = sanitizeText(input.title, 150);
-  const amount = Math.max(1, Number(input.amount));
-
-  batch.set(doc(db, 'organizations', organizationId, 'expenses', expenseId), {
-    id: expenseId,
-    organizationId,
-    title,
-    category: input.category,
-    amount,
-    currency: 'EGP',
-    status: 'posted',
-    expenseDate: input.expenseDate,
-    notes: sanitizeText(input.notes || '', 300),
-    recordedBy: actor.uid,
-    createdAt: serverTimestamp(),
-    updatedAt: serverTimestamp(),
-  });
-
-  enqueueAuditLog(
-    batch,
-    organizationId,
-    actor,
-    'expense.created',
-    'expense',
-    expenseId,
-    `تسجيل مصروف "${title}" بقيمة ${amount} ج.م.`
-  );
 
   try {
-    await batch.commit();
-    return expenseId;
+    return await runTransaction(db, async (tx) => {
+      const verifiedMember = await resolveAuthorizedMemberInTx(tx, organizationId, 'expenses:create');
+      const org = await resolveActiveOrganizationInTx(tx, organizationId);
+
+      const validated = validateCreateExpenseInput(org, input);
+
+      if (validated.idempotencyKey) {
+        const keyDocId = `exp_${validated.idempotencyKey}`;
+        const keyRef = doc(db, 'organizations', organizationId, 'idempotencyKeys', keyDocId);
+        const keySnap = await tx.get(keyRef);
+        if (keySnap.exists()) {
+          const existing = keySnap.data() as { entityId?: string };
+          if (existing.entityId) {
+            return existing.entityId;
+          }
+        }
+      }
+
+      const payload: Record<string, unknown> = {
+        id: expenseId,
+        organizationId,
+        title: validated.title,
+        category: validated.category,
+        amount: validated.amount,
+        amountPiasters: validated.amountPiasters,
+        currency: 'EGP',
+        status: 'posted',
+        expenseDate: validated.expenseDate,
+        notes: validated.notes,
+        recordedBy: verifiedMember.uid,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      };
+      if (validated.idempotencyKey) {
+        payload.idempotencyKey = validated.idempotencyKey;
+      }
+
+      tx.set(doc(db, 'organizations', organizationId, 'expenses', expenseId), payload);
+
+      const entryId = generateId('ldg');
+      tx.set(doc(db, 'organizations', organizationId, 'ledgerEntries', entryId), {
+        id: entryId,
+        organizationId,
+        entryType: 'charge',
+        direction: 'debit',
+        entityType: 'expense',
+        entityId: expenseId,
+        amountPiasters: validated.amountPiasters,
+        amount: validated.amount,
+        currency: 'EGP',
+        description: `مصروف تشغيلي: ${validated.title}`,
+        recordedBy: verifiedMember.uid,
+        createdAt: serverTimestamp(),
+      });
+
+      if (validated.idempotencyKey) {
+        const keyDocId = `exp_${validated.idempotencyKey}`;
+        tx.set(doc(db, 'organizations', organizationId, 'idempotencyKeys', keyDocId), {
+          id: keyDocId,
+          organizationId,
+          entityType: 'expense',
+          entityId: expenseId,
+          createdBy: verifiedMember.uid,
+          createdAt: serverTimestamp(),
+        });
+      }
+
+      enqueueAuditLog(tx, organizationId, verifiedMember, {
+        action: 'expense.created',
+        entityType: 'expense',
+        entityId: expenseId,
+        summary: `تسجيل مصروف "${validated.title}" بقيمة ${validated.amount} ج.م.`,
+        result: 'success',
+        metadata: {
+          after: {
+            title: validated.title,
+            category: validated.category,
+            amountPiasters: validated.amountPiasters,
+            expenseDate: validated.expenseDate,
+          },
+        },
+      });
+
+      return expenseId;
+    });
   } catch (error) {
     handleFirestoreError(error, OperationType.CREATE, path);
   }
@@ -211,29 +682,76 @@ export async function voidExpense(
   organizationId: string,
   expenseId: string,
   reason: string,
-  actor: AuditActor
+  _actor?: AuditActor
 ): Promise<void> {
+  if (!isValidEntityId(expenseId)) {
+    throw new DomainValidationError('معرّف المصروف غير صالح.', 'INVALID_EXPENSE_ID');
+  }
+  const cleanReason = sanitizeText(reason || '', 200);
+  if (cleanReason.length < 3) {
+    throw new DomainValidationError('يجب إدخال سبب واضح لإلغاء المصروف.', 'VOID_REASON_REQUIRED');
+  }
+
   const path = `organizations/${organizationId}/expenses/${expenseId}`;
-  const batch = writeBatch(db);
-
-  batch.update(doc(db, 'organizations', organizationId, 'expenses', expenseId), {
-    status: 'voided',
-    notes: sanitizeText(reason, 300),
-    updatedAt: serverTimestamp(),
-  });
-
-  enqueueAuditLog(
-    batch,
-    organizationId,
-    actor,
-    'expense.voided',
-    'expense',
-    expenseId,
-    `تم إلغاء قيد المصروف (${expenseId}) — السبب: ${sanitizeText(reason, 120)}.`
-  );
 
   try {
-    await batch.commit();
+    await runTransaction(db, async (tx) => {
+      const verifiedMember = await resolveAuthorizedMemberInTx(tx, organizationId, 'expenses:reverse');
+      await resolveActiveOrganizationInTx(tx, organizationId);
+
+      const expRef = doc(db, 'organizations', organizationId, 'expenses', expenseId);
+      const expSnap = await tx.get(expRef);
+      if (!expSnap.exists()) {
+        throw new DomainValidationError('قيد المصروف غير موجود.', 'EXPENSE_NOT_FOUND', 404);
+      }
+
+      const existing = expSnap.data() as ExpenseRecord;
+      if (existing.status === 'voided') {
+        throw new DomainValidationError('هذا المصروف ملغى بالفعل.', 'ALREADY_VOIDED', 409);
+      }
+
+      const amountPiasters = resolveRecordPiasters(existing.amountPiasters, existing.amount);
+
+      const voidExpUpdate: Record<string, unknown> = {
+        status: 'voided',
+        voidReason: cleanReason,
+        voidedBy: verifiedMember.uid,
+        voidedAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      };
+      if (typeof existing.amountPiasters !== 'number') {
+        voidExpUpdate.amountPiasters = amountPiasters;
+      }
+      tx.update(expRef, voidExpUpdate);
+
+      const reversalId = generateId('ldg');
+      tx.set(doc(db, 'organizations', organizationId, 'ledgerEntries', reversalId), {
+        id: reversalId,
+        organizationId,
+        entryType: 'reversal',
+        direction: 'credit',
+        entityType: 'expense',
+        entityId: expenseId,
+        amountPiasters,
+        amount: piastersToEgp(amountPiasters),
+        currency: 'EGP',
+        description: `عكس مصروف (${existing.title}): ${cleanReason}`,
+        recordedBy: verifiedMember.uid,
+        createdAt: serverTimestamp(),
+      });
+
+      enqueueAuditLog(tx, organizationId, verifiedMember, {
+        action: 'expense.voided',
+        entityType: 'expense',
+        entityId: expenseId,
+        summary: `تم عكس وإلغاء قيد المصروف (${expenseId}) — السبب: ${cleanReason}.`,
+        result: 'success',
+        metadata: {
+          before: { status: existing.status, amount: existing.amount },
+          after: { status: 'voided', voidReason: cleanReason },
+        },
+      });
+    });
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, path);
   }

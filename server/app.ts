@@ -7,6 +7,11 @@ import {
   verifyFirebaseBearerToken,
 } from './gemini/authVerifier';
 import { SlidingWindowRateLimiter } from './gemini/security';
+import {
+  createTemaApiRouter,
+  firestoreRestDataStore,
+  type TemaApiDeps,
+} from './api/temaRoutes';
 
 import firebaseConfig from '../firebase-applet-config.json' with { type: 'json' };
 
@@ -14,6 +19,7 @@ export interface ApiAppOptions {
   allowedOrigins?: string[];
   isProduction?: boolean;
   geminiHandlerDeps?: Partial<GeminiHandlerDeps>;
+  temaApiDeps?: Partial<TemaApiDeps>;
 }
 
 const LOCAL_DEV_ORIGINS = ['http://localhost:3000', 'http://127.0.0.1:3000'];
@@ -136,6 +142,15 @@ export function createApiApp(options: ApiAppOptions = {}) {
   };
 
   app.post('/api/gemini/generate', createGeminiHandler(deps));
+
+  const temaDeps: TemaApiDeps = {
+    verifyToken: options.temaApiDeps?.verifyToken ?? verifyFirebaseBearerToken,
+    verifyMembership:
+      options.temaApiDeps?.verifyMembership ?? verifyActiveOrganizationMembership,
+    store: options.temaApiDeps?.store ?? firestoreRestDataStore,
+  };
+
+  app.use('/api/v1', createTemaApiRouter(temaDeps));
 
   // Sanitized API error middleware (never exposes stack traces or secrets)
   app.use('/api', (err: unknown, _req: Request, res: Response, _next: NextFunction) => {

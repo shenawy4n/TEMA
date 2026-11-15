@@ -201,12 +201,19 @@ export const geminiGenerate = onRequest(
     }
     const task = rawTask;
 
-    // Authoritative server-side membership check in Firestore
+    // Authoritative server-side membership & organization status check in Firestore
     try {
       const db = getFirestore(app, firestoreDatabaseId.value());
-      const memberSnap = await db
-        .doc(`organizations/${organizationId}/members/${uid}`)
-        .get();
+      const [orgSnap, memberSnap] = await Promise.all([
+        db.doc(`organizations/${organizationId}`).get(),
+        db.doc(`organizations/${organizationId}/members/${uid}`).get(),
+      ]);
+
+      const orgData = orgSnap.data();
+      if (!orgSnap.exists || !orgData || orgData.status !== 'active') {
+        res.status(403).json({ error: 'Organization is missing or suspended.' });
+        return;
+      }
 
       const memberData = memberSnap.data();
       if (
@@ -263,8 +270,15 @@ export const geminiGenerate = onRequest(
       });
     } catch (error) {
       // Never return provider error details, keys, or stack traces
-      const msg = error instanceof Error ? error.message.toLowerCase() : '';
-      if (msg.includes('api_key_invalid') || msg.includes('permission_denied') || msg.includes('api key not valid')) {
+      const msg = (error instanceof Error ? error.message : String(error ?? ''))
+        .replace(/AIza[0-9A-Za-z_-]{20,}/g, '[REDACTED]')
+        .toLowerCase();
+      if (
+        msg.includes('api_key_invalid') ||
+        msg.includes('permission_denied') ||
+        msg.includes('api key not valid') ||
+        msg.includes('missing gemini_api_key')
+      ) {
         res.status(503).json({ error: 'خدمة الذكاء الاصطناعي غير مهيأة حالياً على الخادم.' });
         return;
       }

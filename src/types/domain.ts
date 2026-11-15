@@ -24,6 +24,14 @@ export type ExpenseCategory = 'rent' | 'salaries' | 'utilities' | 'printing' | '
 
 export type ExpenseStatus = 'posted' | 'voided';
 
+export type EnrollmentStatus = 'active' | 'removed';
+
+export type LedgerEntryType = 'charge' | 'payment' | 'reversal' | 'adjustment';
+
+export type LedgerEntityType = 'payment' | 'expense';
+
+export type AuditResult = 'success' | 'denied' | 'failure';
+
 export type InvitationStatus = 'pending' | 'accepted' | 'revoked';
 
 export interface UserProfile {
@@ -53,6 +61,10 @@ export interface Organization {
   themePreference: ThemePreference;
   academicYear: string;
   status: 'active' | 'suspended';
+  totalStudentsCount?: number;
+  activeStudentsCount?: number;
+  inactiveStudentsCount?: number;
+  archivedStudentsCount?: number;
   createdAt: unknown;
   updatedAt: unknown;
 }
@@ -94,12 +106,41 @@ export interface StudyGroup {
   teacherName: string;
   capacity: number;
   studentCount: number;
+  lastEnrollmentId?: string;
   scheduleSummary?: string;
   monthlyFee: number;
   status: GroupStatus;
   createdBy: string;
   createdAt: unknown;
   updatedAt: unknown;
+}
+
+export interface GroupEnrollment {
+  id: string;
+  organizationId: string;
+  groupId: string;
+  studentId: string;
+  studentName: string;
+  groupName: string;
+  status: EnrollmentStatus;
+  enrolledBy: string;
+  removedBy?: string;
+  enrolledAt: unknown;
+  removedAt?: unknown;
+  createdAt: unknown;
+  updatedAt: unknown;
+}
+
+export interface SessionRescheduleEntry {
+  fromDate: string;
+  fromStartTime: string;
+  fromEndTime: string;
+  toDate: string;
+  toStartTime: string;
+  toEndTime: string;
+  reason?: string;
+  changedBy: string;
+  changedAt: string;
 }
 
 export interface ClassSession {
@@ -115,6 +156,8 @@ export interface ClassSession {
   endTime: string;
   room?: string;
   status: SessionStatus;
+  cancellationReason?: string;
+  rescheduleHistory?: SessionRescheduleEntry[];
   createdBy: string;
   createdAt: unknown;
   updatedAt: unknown;
@@ -143,12 +186,20 @@ export interface PaymentRecord {
   amount: number;
   paidAmount: number;
   dueAmount: number;
+  amountPiasters?: number;
+  paidAmountPiasters?: number;
+  dueAmountPiasters?: number;
   currency: 'EGP';
   category: PaymentCategory;
   method: PaymentMethod;
   status: PaymentStatus;
+  paymentDate?: string;
   referenceNumber?: string;
+  idempotencyKey?: string;
   notes?: string;
+  voidReason?: string;
+  voidedBy?: string;
+  voidedAt?: unknown;
   recordedBy: string;
   createdAt: unknown;
   updatedAt: unknown;
@@ -160,13 +211,38 @@ export interface ExpenseRecord {
   title: string;
   category: ExpenseCategory;
   amount: number;
+  amountPiasters?: number;
   currency: 'EGP';
   status: ExpenseStatus;
   expenseDate: string;
+  idempotencyKey?: string;
   notes?: string;
+  voidReason?: string;
+  voidedBy?: string;
+  voidedAt?: unknown;
   recordedBy: string;
   createdAt: unknown;
   updatedAt: unknown;
+}
+
+export interface LedgerEntry {
+  id: string;
+  organizationId: string;
+  entryType: LedgerEntryType;
+  direction: 'debit' | 'credit';
+  entityType: LedgerEntityType;
+  entityId: string;
+  studentId?: string;
+  studentName?: string;
+  groupId?: string;
+  amountPiasters: number;
+  amount: number;
+  currency: 'EGP';
+  description: string;
+  relatedEntryId?: string;
+  idempotencyKey?: string;
+  recordedBy: string;
+  createdAt: unknown;
 }
 
 export interface AuditLog {
@@ -179,6 +255,9 @@ export interface AuditLog {
   entityType: string;
   entityId: string;
   summary: string;
+  result?: AuditResult;
+  correlationId?: string;
+  metadata?: Record<string, unknown>;
   createdAt: unknown;
 }
 

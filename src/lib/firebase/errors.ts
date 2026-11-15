@@ -1,4 +1,5 @@
 import { auth } from './config';
+import { DomainValidationError } from '@/src/lib/domain/money';
 
 export enum OperationType {
   CREATE = 'create',
@@ -31,6 +32,9 @@ export function handleFirestoreError(
   operationType: OperationType,
   path: string | null
 ): never {
+  if (error instanceof DomainValidationError) {
+    throw error;
+  }
   const errInfo: FirestoreErrorInfo = {
     error: error instanceof Error ? error.message : String(error),
     authInfo: {
@@ -53,6 +57,9 @@ export function handleFirestoreError(
 }
 
 export function getArabicErrorMessage(error: unknown): string {
+  if (error instanceof DomainValidationError) {
+    return error.message;
+  }
   if (error instanceof Error) {
     const msg = error.message;
     if (msg.includes('permission-denied') || msg.includes('Missing or insufficient permissions')) {

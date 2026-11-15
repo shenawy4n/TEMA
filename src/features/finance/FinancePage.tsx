@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react';
-import { Plus, Wallet, Ban } from 'lucide-react';
+import { Plus, Wallet, Ban, CheckCircle2 } from 'lucide-react';
 import { AppShell } from '@/src/components/layout/AppShell';
 import { PageHeader } from '@/src/components/layout/PageHeader';
 import { MetricCard } from '@/src/components/ui/MetricCard';
@@ -18,17 +18,24 @@ import {
   createExpense,
   createPayment,
   listExpenses,
+  listLedgerEntries,
   listPayments,
+  settlePaymentInstallment,
   voidExpense,
   voidPayment,
 } from '@/src/services/financeService';
 import { listStudents } from '@/src/services/studentService';
+import { listEnrollmentsByStudent } from '@/src/services/groupService';
+import { deriveFinancialSummaryFromLedger } from '@/src/lib/domain/ledger';
+import { computePaymentBreakdown, DomainValidationError, egpToPiasters } from '@/src/lib/domain/money';
 import { getArabicErrorMessage } from '@/src/lib/firebase/errors';
-import { formatCurrencyEGP, formatDateArabic, getTodayIsoDate } from '@/src/lib/utils/format';
+import { formatCurrencyEGP, formatDateArabic, generateId, getTodayIsoDate } from '@/src/lib/utils/format';
 import { cn } from '@/src/lib/utils/cn';
 import type {
   ExpenseCategory,
   ExpenseRecord,
+  GroupEnrollment,
+  LedgerEntry,
   PaymentCategory,
   PaymentMethod,
   PaymentRecord,
@@ -44,7 +51,9 @@ export function FinancePage() {
   const [tab, setTab] = useState<FinanceTab>('payments');
   const [payments, setPayments] = useState<PaymentRecord[]>([]);
   const [expenses, setExpenses] = useState<ExpenseRecord[]>([]);
+  const [ledgerEntries, setLedgerEntries] = useState<LedgerEntry[]>([]);
   const [students, setStudents] = useState<Student[]>([]);
+  const [studentEnrollments, setStudentEnrollments] = useState<GroupEnrollment[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -53,12 +62,14 @@ export function FinancePage() {
 
   // Payment form
   const [studentId, setStudentId] = useState('');
+  const [groupId, setGroupId] = useState('');
   const [payAmount, setPayAmount] = useState('350');
   const [paidAmount, setPaidAmount] = useState('350');
   const [payCategory, setPayCategory] = useState<PaymentCategory>('tuition');
   const [payMethod, setPayMethod] = useState<PaymentMethod>('cash');
   const [payRef, setPayRef] = useState('');
   const [payNotes, setPayNotes] = useState('');
+  const [payIdempotencyKey, setPayIdempotencyKey] = useState('');
   const [submittingPay, setSubmittingPay] = useState(false);
 
   // Expense form
@@ -67,7 +78,15 @@ export function FinancePage() {
   const [expAmount, setExpAmount] = useState('');
   const [expDate, setExpDate] = useState(getTodayIsoDate());
   const [expNotes, setExpNotes] = useState('');
+  const [expIdempotencyKey, setExpIdempotencyKey] = useState('');
   const [submittingExp, setSubmittingExp] = useState(false);
+
+  // Settle installment modal
+  const [settleTarget, setSettleTarget] = useState<PaymentRecord | null>(null);
+  const [settleAmount, setSettleAmount] = useState('');
+  const [settleMethod, setSettleMethod] = useState<PaymentMethod>('cash');
+  const [settleRef, setSettleRef] = useState('');
+  const [submittingSettle, setSubmittingSettle] = useState(false);
 
   // Void dialog
   const [voidTarget, setVoidTarget] = useState<{ type: 'payment' | 'expense'; id: string; label: string } | null>(null);
@@ -80,15 +99,20 @@ export function FinancePage() {
     setLoading(true);
     setError(null);
     try {
-      const [payData, expData, stuData] = await Promise.all([
+      const [payData, expData, ledgerData, stuData] = await Promise.all([
         listPayments(organization.id),
         canManageExpenses ? listExpenses(organization.id) : Promise.resolve([]),
+        listLedgerEntries(organization.id),
         listStudents(organization.id),
       ]);
       setPayments(payData);
       setExpenses(expData);
-      setStudents(stuData);
-      if (stuData.length > 0 && !studentId) setStudentId(stuData[0].id);
+      setLedgerEntries(ledgerData);
+      setStudents(stuData.filter((s) => s.status !== 'archived'));
+      if (stuData.length > 0 && !studentId) {
+        const firstActive = stuData.find((s) => s.status !== 'archived');
+        if (firstActive) setStudentId(firstActive.id);
+      }
     } catch (err) {
       setError(getArabicErrorMessage(err));
     } finally {
@@ -100,14 +124,47 @@ export function FinancePage() {
     void loadFinance();
   }, [loadFinance]);
 
+  useEffect(() => {
+    if (!organization || !studentId || !payModalOpen) {
+      setStudentEnrollments([]);
+      setGroupId('');
+      return;
+    }
+    let active = true;
+    listEnrollmentsByStudent(organization.id, studentId)
+      .then((list) => {
+        if (active) {
+          setStudentEnrollments(list);
+          setGroupId('');
+        }
+      })
+      .catch(() => {
+        if (active) setStudentEnrollments([]);
+      });
+    return () => {
+      active = false;
+    };
+  }, [organization, studentId, payModalOpen]);
+
   const summary = useMemo(() => {
-    const activePays = payments.filter((p) => p.status !== 'voided');
-    const activeExps = expenses.filter((e) => e.status !== 'voided');
-    const collected = activePays.reduce((s, p) => s + p.paidAmount, 0);
-    const outstanding = activePays.reduce((s, p) => s + p.dueAmount, 0);
-    const totalExpenses = activeExps.reduce((s, e) => s + e.amount, 0);
-    return { collected, outstanding, totalExpenses, net: collected - totalExpenses };
-  }, [payments, expenses]);
+    const ledgerSummary = deriveFinancialSummaryFromLedger(ledgerEntries, payments, expenses);
+    return {
+      collected: ledgerSummary.collectedEgp,
+      outstanding: ledgerSummary.outstandingEgp,
+      totalExpenses: ledgerSummary.expensesEgp,
+      net: ledgerSummary.netEgp,
+    };
+  }, [ledgerEntries, payments, expenses]);
+
+  const openPayModal = () => {
+    setPayIdempotencyKey(generateId('idem'));
+    setPayModalOpen(true);
+  };
+
+  const openExpModal = () => {
+    setExpIdempotencyKey(generateId('idem'));
+    setExpModalOpen(true);
+  };
 
   const handleAddPayment = async (e: FormEvent) => {
     e.preventDefault();
@@ -118,6 +175,19 @@ export function FinancePage() {
       return;
     }
 
+    const totalVal = payAmount.trim() === '' ? NaN : Number(payAmount);
+    const paidVal = paidAmount.trim() === '' ? NaN : Number(paidAmount);
+    try {
+      computePaymentBreakdown(totalVal, paidVal);
+    } catch (validationErr) {
+      showToast({
+        type: 'error',
+        title: 'بيانات الدفعة غير صالحة',
+        message: validationErr instanceof DomainValidationError ? validationErr.message : getArabicErrorMessage(validationErr),
+      });
+      return;
+    }
+
     setSubmittingPay(true);
     try {
       await createPayment(
@@ -125,12 +195,14 @@ export function FinancePage() {
         {
           studentId: stu.id,
           studentName: stu.fullName,
-          amount: Number(payAmount) || 0,
-          paidAmount: Number(paidAmount) || 0,
+          groupId: groupId || undefined,
+          amount: totalVal,
+          paidAmount: paidVal,
           category: payCategory,
           method: payMethod,
           referenceNumber: payRef,
           notes: payNotes,
+          idempotencyKey: payIdempotencyKey || generateId('idem'),
         },
         {
           uid: membership.uid,
@@ -142,6 +214,7 @@ export function FinancePage() {
       setPayModalOpen(false);
       setPayRef('');
       setPayNotes('');
+      setGroupId('');
       await loadFinance();
     } catch (err) {
       showToast({ type: 'error', title: 'تعذر تسجيل الدفعة', message: getArabicErrorMessage(err) });
@@ -153,6 +226,18 @@ export function FinancePage() {
   const handleAddExpense = async (e: FormEvent) => {
     e.preventDefault();
     if (!organization || !membership || submittingExp) return;
+    const amountVal = expAmount.trim() === '' ? NaN : Number(expAmount);
+    try {
+      egpToPiasters(amountVal, { allowZero: false, fieldLabel: 'قيمة المصروف' });
+    } catch (validationErr) {
+      showToast({
+        type: 'error',
+        title: 'قيمة المصروف غير صالحة',
+        message: validationErr instanceof DomainValidationError ? validationErr.message : getArabicErrorMessage(validationErr),
+      });
+      return;
+    }
+
     setSubmittingExp(true);
     try {
       await createExpense(
@@ -160,9 +245,10 @@ export function FinancePage() {
         {
           title: expTitle,
           category: expCategory,
-          amount: Number(expAmount) || 0,
+          amount: amountVal,
           expenseDate: expDate,
           notes: expNotes,
+          idempotencyKey: expIdempotencyKey || generateId('idem'),
         },
         {
           uid: membership.uid,
@@ -183,6 +269,47 @@ export function FinancePage() {
     }
   };
 
+  const openSettleModal = (record: PaymentRecord) => {
+    setSettleTarget(record);
+    setSettleAmount(String(record.dueAmount));
+    setSettleMethod(record.method);
+    setSettleRef('');
+  };
+
+  const handleSettleInstallment = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!organization || !settleTarget || submittingSettle) return;
+    const installmentVal = settleAmount.trim() === '' ? NaN : Number(settleAmount);
+    try {
+      egpToPiasters(installmentVal, { allowZero: false, fieldLabel: 'مبلغ السداد' });
+    } catch (validationErr) {
+      showToast({
+        type: 'error',
+        title: 'مبلغ السداد غير صالح',
+        message: validationErr instanceof DomainValidationError ? validationErr.message : getArabicErrorMessage(validationErr),
+      });
+      return;
+    }
+
+    setSubmittingSettle(true);
+    try {
+      await settlePaymentInstallment(
+        organization.id,
+        settleTarget.id,
+        installmentVal,
+        settleMethod,
+        settleRef
+      );
+      showToast({ type: 'success', title: 'تم تسجيل سداد القسط بنجاح' });
+      setSettleTarget(null);
+      await loadFinance();
+    } catch (err) {
+      showToast({ type: 'error', title: 'تعذر سداد القسط', message: getArabicErrorMessage(err) });
+    } finally {
+      setSubmittingSettle(false);
+    }
+  };
+
   const handleConfirmVoid = async () => {
     if (!organization || !membership || !voidTarget) return;
     setVoiding(true);
@@ -197,7 +324,7 @@ export function FinancePage() {
       } else {
         await voidExpense(organization.id, voidTarget.id, 'إلغاء محاسبي معتمد', actor);
       }
-      showToast({ type: 'success', title: 'تم إلغاء القيد مع الحفاظ على سجل التدقيق' });
+      showToast({ type: 'success', title: 'تم إلغاء القيد وعكس أثره في دفتر الأستاذ' });
       setVoidTarget(null);
       await loadFinance();
     } catch (err) {
@@ -260,19 +387,32 @@ export function FinancePage() {
     {
       key: 'actions',
       header: 'إجراء',
-      render: (r) =>
-        canManageExpenses && r.status !== 'voided' ? (
-          <Button
-            size="sm"
-            variant="ghost"
-            icon={<Ban className="h-3.5 w-3.5" />}
-            onClick={() => setVoidTarget({ type: 'payment', id: r.id, label: r.studentName })}
-          >
-            إلغاء قيد
-          </Button>
-        ) : (
-          <span className="text-xs text-slate-400">—</span>
-        ),
+      render: (r) => (
+        <div className="flex items-center gap-1">
+          {(r.status === 'pending' || r.status === 'partial') && (
+            <Button
+              size="sm"
+              variant="outline"
+              icon={<CheckCircle2 className="h-3.5 w-3.5" />}
+              onClick={() => openSettleModal(r)}
+            >
+              سداد
+            </Button>
+          )}
+          {canManageExpenses && r.status !== 'voided' ? (
+            <Button
+              size="sm"
+              variant="ghost"
+              icon={<Ban className="h-3.5 w-3.5" />}
+              onClick={() => setVoidTarget({ type: 'payment', id: r.id, label: r.studentName })}
+            >
+              إلغاء قيد
+            </Button>
+          ) : (
+            r.status !== 'pending' && r.status !== 'partial' && <span className="text-xs text-slate-400">—</span>
+          )}
+        </div>
+      ),
     },
   ];
 
@@ -333,14 +473,14 @@ export function FinancePage() {
           description="فصل واضح بين التحصيلات الفعلية والمبالغ المستحقة والمصروفات مع منع الحذف النهائي للقيود."
           actions={
             <div className="flex items-center gap-2">
-              <Button icon={<Plus className="h-4 w-4" />} onClick={() => setPayModalOpen(true)}>
+              <Button icon={<Plus className="h-4 w-4" />} onClick={openPayModal}>
                 تسجيل دفعة
               </Button>
               {canManageExpenses && (
                 <Button
                   variant="outline"
                   icon={<Plus className="h-4 w-4" />}
-                  onClick={() => setExpModalOpen(true)}
+                  onClick={openExpModal}
                 >
                   تسجيل مصروف
                 </Button>
@@ -446,11 +586,22 @@ export function FinancePage() {
                   </option>
                 ))}
               </Select>
+              {studentEnrollments.length > 0 && (
+                <Select label="المجموعة الدراسية (اختياري)" value={groupId} onChange={(e) => setGroupId(e.target.value)}>
+                  <option value="">بدون ربط بمجموعة محددة</option>
+                  {studentEnrollments.map((enr) => (
+                    <option key={enr.id} value={enr.groupId}>
+                      {enr.groupName}
+                    </option>
+                  ))}
+                </Select>
+              )}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <Input
                   label="إجمالي المستحق (ج.م)"
                   type="number"
-                  min={1}
+                  step="0.01"
+                  min={0.01}
                   value={payAmount}
                   onChange={(e) => setPayAmount(e.target.value)}
                   required
@@ -458,6 +609,7 @@ export function FinancePage() {
                 <Input
                   label="المبلغ المدفوع فعلياً (ج.م)"
                   type="number"
+                  step="0.01"
                   min={0}
                   value={paidAmount}
                   onChange={(e) => setPaidAmount(e.target.value)}
@@ -538,7 +690,8 @@ export function FinancePage() {
             <Input
               label="المبلغ (ج.م)"
               type="number"
-              min={1}
+              step="0.01"
+              min={0.01}
               value={expAmount}
               onChange={(e) => setExpAmount(e.target.value)}
               required
@@ -564,6 +717,57 @@ export function FinancePage() {
         </form>
       </Modal>
 
+      {/* Settle Installment Modal */}
+      <Modal
+        isOpen={Boolean(settleTarget)}
+        onClose={() => setSettleTarget(null)}
+        title={`سداد رصيد مستحق — ${settleTarget?.studentName || ''}`}
+      >
+        {settleTarget && (
+          <form onSubmit={handleSettleInstallment} className="space-y-4">
+            <p className="text-xs text-slate-600 dark:text-slate-400">
+              الرصيد المتبقي المستحق: <span className="font-semibold text-amber-600 dark:text-amber-400">{formatCurrencyEGP(settleTarget.dueAmount)}</span>
+            </p>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <Input
+                label="مبلغ السداد (ج.م)"
+                type="number"
+                step="0.01"
+                min={0.01}
+                max={settleTarget.dueAmount}
+                value={settleAmount}
+                onChange={(e) => setSettleAmount(e.target.value)}
+                required
+              />
+              <Select
+                label="طريقة الدفع"
+                value={settleMethod}
+                onChange={(e) => setSettleMethod(e.target.value as PaymentMethod)}
+              >
+                <option value="cash">نقدي (كاش)</option>
+                <option value="vodafone_cash">فودافون كاش</option>
+                <option value="instapay">إنستاباي (InstaPay)</option>
+                <option value="bank_transfer">تحويل بنكي</option>
+                <option value="card">بطاقة بنكية</option>
+              </Select>
+            </div>
+            <Input
+              label="رقم مرجعي (اختياري)"
+              value={settleRef}
+              onChange={(e) => setSettleRef(e.target.value)}
+            />
+            <div className="pt-3 flex items-center justify-end gap-2.5">
+              <Button variant="outline" onClick={() => setSettleTarget(null)}>
+                إلغاء
+              </Button>
+              <Button type="submit" isLoading={submittingSettle}>
+                تأكيد السداد
+              </Button>
+            </div>
+          </form>
+        )}
+      </Modal>
+
       <ConfirmDialog
         isOpen={Boolean(voidTarget)}
         onClose={() => setVoidTarget(null)}
@@ -571,7 +775,7 @@ export function FinancePage() {
         isDanger
         isLoading={voiding}
         title="تأكيد إلغاء القيد المالي"
-        message={`سيتم تعليم القيد (${voidTarget?.label || ''}) كـ "ملغى" مع الاحتفاظ به في سجل التدقيق المالي دون حذفه نهائياً. هل تريد المتابعة؟`}
+        message={`سيتم تعليم القيد (${voidTarget?.label || ''}) كـ "ملغى" وتسجيل قيد عكسي في دفتر الأستاذ دون حذفه نهائياً. هل تريد المتابعة؟`}
         confirmLabel="نعم، إلغاء القيد"
       />
     </AppShell>

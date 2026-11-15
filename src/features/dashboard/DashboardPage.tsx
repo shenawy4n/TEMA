@@ -22,10 +22,12 @@ import { LoadingState } from '@/src/components/ui/LoadingState';
 import { Button } from '@/src/components/ui/Button';
 import { useTenant } from '@/src/hooks/useTenant';
 import { listStudents } from '@/src/services/studentService';
-import { listGroups } from '@/src/services/groupService';
+import { listGroups, listOrganizationEnrollments } from '@/src/services/groupService';
 import { listSessions } from '@/src/services/sessionService';
 import { listAttendanceByOrganization } from '@/src/services/attendanceService';
-import { listExpenses, listPayments } from '@/src/services/financeService';
+import { listExpenses, listLedgerEntries, listPayments } from '@/src/services/financeService';
+import { deriveFinancialSummaryFromLedger } from '@/src/lib/domain/ledger';
+import { calculateAttendanceMetrics } from '@/src/lib/domain/scheduling';
 import { getArabicErrorMessage } from '@/src/lib/firebase/errors';
 import { formatCurrencyEGP, formatNumber, getTodayIsoDate } from '@/src/lib/utils/format';
 import { cn } from '@/src/lib/utils/cn';
@@ -33,6 +35,8 @@ import type {
   AttendanceRecord,
   ClassSession,
   ExpenseRecord,
+  GroupEnrollment,
+  LedgerEntry,
   PaymentRecord,
   Student,
   StudyGroup,
@@ -49,10 +53,12 @@ export function DashboardPage() {
 
   const [students, setStudents] = useState<Student[]>([]);
   const [groups, setGroups] = useState<StudyGroup[]>([]);
+  const [enrollments, setEnrollments] = useState<GroupEnrollment[]>([]);
   const [sessions, setSessions] = useState<ClassSession[]>([]);
   const [attendance, setAttendance] = useState<AttendanceRecord[]>([]);
   const [payments, setPayments] = useState<PaymentRecord[]>([]);
   const [expenses, setExpenses] = useState<ExpenseRecord[]>([]);
+  const [ledgerEntries, setLedgerEntries] = useState<LedgerEntry[]>([]);
 
   const canViewPayments = membership ? ['owner', 'accountant', 'assistant'].includes(membership.role) : false;
   const canViewExpenses = membership ? ['owner', 'accountant'].includes(membership.role) : false;
@@ -63,21 +69,25 @@ export function DashboardPage() {
     setError(null);
 
     try {
-      const [stuData, grpData, sesData, attData, payData, expData] = await Promise.all([
+      const [stuData, grpData, enrData, sesData, attData, payData, expData, ledgerData] = await Promise.all([
         listStudents(organization.id),
         listGroups(organization.id),
+        listOrganizationEnrollments(organization.id),
         listSessions(organization.id),
         listAttendanceByOrganization(organization.id),
         canViewPayments ? listPayments(organization.id) : Promise.resolve([]),
         canViewExpenses ? listExpenses(organization.id) : Promise.resolve([]),
+        canViewPayments ? listLedgerEntries(organization.id) : Promise.resolve([]),
       ]);
 
       setStudents(stuData);
       setGroups(grpData);
+      setEnrollments(enrData);
       setSessions(sesData);
       setAttendance(attData);
       setPayments(payData);
       setExpenses(expData);
+      setLedgerEntries(ledgerData);
     } catch (err) {
       setError(getArabicErrorMessage(err));
     } finally {
@@ -96,10 +106,8 @@ export function DashboardPage() {
     const totalStudents = students.length;
     const activeStudents = students.filter((s) => s.status === 'active').length;
     const activeGroups = groups.filter((g) => g.status === 'active').length;
+    const activeEnrollmentsCount = enrollments.filter((e) => e.status === 'active').length;
     const todaySessions = sessions.filter((s) => s.date === todayIso && s.status !== 'cancelled').length;
-
-    const activePayments = payments.filter((p) => p.status !== 'voided');
-    const activeExpenses = expenses.filter((e) => e.status !== 'voided');
 
     const matchesDateFilter = (dateStr?: string, createdAt?: unknown): boolean => {
       if (dateFilter === 'all') return true;
@@ -112,25 +120,29 @@ export function DashboardPage() {
       return dateFilter === 'today' ? iso === todayIso : iso.startsWith(currentMonthPrefix);
     };
 
-    const filteredPayments = activePayments.filter((p) => matchesDateFilter(undefined, p.createdAt));
-    const filteredExpenses = activeExpenses.filter((e) => matchesDateFilter(e.expenseDate, e.createdAt));
+    const filteredPayments = payments.filter((p) => matchesDateFilter(p.paymentDate, p.createdAt));
+    const filteredExpenses = expenses.filter((e) => matchesDateFilter(e.expenseDate, e.createdAt));
+    const filteredLedger = ledgerEntries.filter((entry) => matchesDateFilter(undefined, entry.createdAt));
 
-    const totalCollected = filteredPayments.reduce((sum, p) => sum + (p.paidAmount || 0), 0);
-    const totalDue = activePayments.reduce((sum, p) => sum + (p.dueAmount || 0), 0);
-    const totalExpenses = filteredExpenses.reduce((sum, e) => sum + (e.amount || 0), 0);
-    const netRevenue = totalCollected - totalExpenses;
+    const periodFinance = deriveFinancialSummaryFromLedger(
+      filteredLedger,
+      filteredPayments,
+      filteredExpenses
+    );
+    const overallFinance = deriveFinancialSummaryFromLedger(ledgerEntries, payments, expenses);
 
     return {
       totalStudents,
       activeStudents,
       activeGroups,
+      activeEnrollmentsCount,
       todaySessions,
-      totalCollected,
-      totalDue,
-      totalExpenses,
-      netRevenue,
+      totalCollected: periodFinance.collectedEgp,
+      totalDue: overallFinance.outstandingEgp,
+      totalExpenses: periodFinance.expensesEgp,
+      netRevenue: periodFinance.netEgp,
     };
-  }, [students, groups, sessions, payments, expenses, dateFilter, todayIso, currentMonthPrefix]);
+  }, [students, groups, enrollments, sessions, payments, expenses, ledgerEntries, dateFilter, todayIso, currentMonthPrefix]);
 
   const upcomingSessions = useMemo(
     () =>
@@ -146,13 +158,15 @@ export function DashboardPage() {
   );
 
   const attendanceSummary = useMemo(() => {
-    const total = attendance.length;
-    const present = attendance.filter((a) => a.status === 'present').length;
-    const late = attendance.filter((a) => a.status === 'late').length;
-    const absent = attendance.filter((a) => a.status === 'absent').length;
-    const rate = total > 0 ? Math.round(((present + late) / total) * 100) : 0;
-    return { total, present, late, absent, rate };
-  }, [attendance]);
+    const calculated = calculateAttendanceMetrics(attendance, sessions);
+    return {
+      total: calculated.total,
+      present: calculated.present,
+      late: calculated.late,
+      absent: calculated.absent,
+      rate: calculated.attendanceRatePercent,
+    };
+  }, [attendance, sessions]);
 
   const alerts = useMemo(() => {
     const list: Array<{ title: string; detail: string; to: string }> = [];
@@ -241,14 +255,14 @@ export function DashboardPage() {
               <MetricCard
                 label="إجمالي الطلاب"
                 value={formatNumber(metrics.totalStudents)}
-                helperText="جميع الطلاب المسجلين"
+                helperText="جميع الطلاب المسجلين بالمنظمة"
                 icon={<Users className="h-5 w-5" />}
                 tone="primary"
               />
               <MetricCard
                 label="الطلاب النشطون"
                 value={formatNumber(metrics.activeStudents)}
-                helperText="الملتحقون حالياً بالدراسة"
+                helperText={`${formatNumber(metrics.activeEnrollmentsCount)} تسجيل نشط بالمجموعات`}
                 icon={<UserCheck className="h-5 w-5" />}
                 tone="success"
               />

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react';
-import { CalendarClock, Plus } from 'lucide-react';
+import { CalendarClock, Plus, CheckCircle2, Ban, Clock } from 'lucide-react';
 import { AppShell } from '@/src/components/layout/AppShell';
 import { PageHeader } from '@/src/components/layout/PageHeader';
 import { Button } from '@/src/components/ui/Button';
@@ -12,13 +12,24 @@ import { Input } from '@/src/components/ui/Input';
 import { Select } from '@/src/components/ui/Select';
 import { useTenant } from '@/src/hooks/useTenant';
 import { useToast } from '@/src/hooks/useToast';
-import { createSession, listSessions } from '@/src/services/sessionService';
+import {
+  createSession,
+  listSessions,
+  rescheduleSession,
+  updateSessionStatus,
+} from '@/src/services/sessionService';
 import { listGroups } from '@/src/services/groupService';
+import { assertValidSessionSchedule } from '@/src/lib/domain/scheduling';
 import { getArabicErrorMessage } from '@/src/lib/firebase/errors';
 import { getTodayIsoDate } from '@/src/lib/utils/format';
-import type { ClassSession, StudyGroup } from '@/src/types/domain';
+import type { ClassSession, SessionStatus, StudyGroup } from '@/src/types/domain';
 
 const WEEK_DAYS = ['السبت', 'الأحد', 'الاثنين', 'الثلاثاء', 'الأربعاء', 'الخميس', 'الجمعة'];
+const SESSION_STATUS_LABELS: Record<SessionStatus, string> = {
+  scheduled: 'مجدولة',
+  completed: 'مكتملة',
+  cancelled: 'ملغاة',
+};
 
 export function SessionsPage() {
   const { organization, membership } = useTenant();
@@ -39,7 +50,16 @@ export function SessionsPage() {
   const [formError, setFormError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
+  const [rescheduleTarget, setRescheduleTarget] = useState<ClassSession | null>(null);
+  const [rescheduleDate, setRescheduleDate] = useState('');
+  const [rescheduleStart, setRescheduleStart] = useState('');
+  const [rescheduleEnd, setRescheduleEnd] = useState('');
+  const [rescheduleReason, setRescheduleReason] = useState('');
+  const [rescheduling, setRescheduling] = useState(false);
+
   const canCreate = membership ? ['owner', 'teacher', 'assistant'].includes(membership.role) : false;
+
+  const activeGroups = useMemo(() => groups.filter((g) => g.status === 'active'), [groups]);
 
   const loadData = useCallback(async () => {
     if (!organization) return;
@@ -52,8 +72,9 @@ export function SessionsPage() {
       ]);
       setSessions(sesData);
       setGroups(grpData);
-      if (grpData.length > 0 && !groupId) {
-        setGroupId(grpData[0].id);
+      const activeList = grpData.filter((g) => g.status === 'active');
+      if (activeList.length > 0 && (!groupId || !activeList.some((g) => g.id === groupId))) {
+        setGroupId(activeList[0].id);
       }
     } catch (err) {
       setError(getArabicErrorMessage(err));
@@ -75,13 +96,19 @@ export function SessionsPage() {
     if (!organization || !membership || submitting) return;
     setFormError(null);
 
-    const selectedGroup = groups.find((g) => g.id === groupId);
+    const selectedGroup = activeGroups.find((g) => g.id === groupId);
     if (!selectedGroup) {
-      setFormError('يرجى اختيار مجموعة دراسية أولاً.');
+      setFormError('يرجى اختيار مجموعة دراسية نشطة أولاً.');
       return;
     }
     if (title.trim().length < 2) {
       setFormError('يرجى إدخال عنوان الحصة.');
+      return;
+    }
+    try {
+      assertValidSessionSchedule(date, startTime, endTime);
+    } catch (err) {
+      setFormError(getArabicErrorMessage(err));
       return;
     }
 
@@ -115,6 +142,63 @@ export function SessionsPage() {
       setFormError(getArabicErrorMessage(err));
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const handleSessionStatus = async (ses: ClassSession, nextStatus: SessionStatus) => {
+    if (!organization || !membership || !canCreate) return;
+    try {
+      await updateSessionStatus(
+        organization.id,
+        ses.id,
+        nextStatus,
+        {
+          uid: membership.uid,
+          displayName: membership.displayName,
+          role: membership.role,
+        },
+        nextStatus === 'cancelled' ? 'إلغاء من جدول الحصص' : undefined
+      );
+      showToast({ type: 'success', title: `تم تحديث حالة الحصة إلى (${SESSION_STATUS_LABELS[nextStatus]})` });
+      await loadData();
+    } catch (err) {
+      showToast({ type: 'error', title: 'تعذر تحديث الحصة', message: getArabicErrorMessage(err) });
+    }
+  };
+
+  const openReschedule = (ses: ClassSession) => {
+    setRescheduleTarget(ses);
+    setRescheduleDate(ses.date);
+    setRescheduleStart(ses.startTime);
+    setRescheduleEnd(ses.endTime);
+    setRescheduleReason('');
+  };
+
+  const handleReschedule = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!organization || !rescheduleTarget || rescheduling) return;
+    try {
+      assertValidSessionSchedule(rescheduleDate, rescheduleStart, rescheduleEnd);
+    } catch (err) {
+      showToast({ type: 'error', title: 'بيانات الموعد غير صالحة', message: getArabicErrorMessage(err) });
+      return;
+    }
+
+    setRescheduling(true);
+    try {
+      await rescheduleSession(organization.id, rescheduleTarget.id, {
+        date: rescheduleDate,
+        startTime: rescheduleStart,
+        endTime: rescheduleEnd,
+        reason: rescheduleReason,
+      });
+      showToast({ type: 'success', title: 'تم إعادة جدولة الحصة' });
+      setRescheduleTarget(null);
+      await loadData();
+    } catch (err) {
+      showToast({ type: 'error', title: 'تعذر تعديل الموعد', message: getArabicErrorMessage(err) });
+    } finally {
+      setRescheduling(false);
     }
   };
 
@@ -196,17 +280,49 @@ export function SessionsPage() {
                   <div className="divide-y divide-slate-200 dark:divide-slate-800">
                     {upcomingSessions.map((ses) => (
                       <div key={ses.id} className="py-3 flex items-center justify-between gap-3">
-                        <div>
-                          <p className="text-sm font-semibold">{ses.title}</p>
+                        <div className="min-w-0">
+                          <p className="text-sm font-semibold">
+                            {ses.title}{' '}
+                            <span className="text-xs font-normal text-slate-500 dark:text-slate-400">
+                              ({SESSION_STATUS_LABELS[ses.status]})
+                            </span>
+                          </p>
                           <p className="text-xs text-slate-500 dark:text-slate-400">
                             {ses.groupName} · {ses.teacherName}
                           </p>
                         </div>
-                        <div className="text-left font-mono-tabular text-xs">
-                          <p className="font-medium">{ses.date}</p>
-                          <p className="text-slate-500 dark:text-slate-400">
-                            {ses.startTime} - {ses.endTime}
-                          </p>
+                        <div className="flex items-center gap-2 shrink-0">
+                          <div className="text-left font-mono-tabular text-xs">
+                            <p className="font-medium">{ses.date}</p>
+                            <p className="text-slate-500 dark:text-slate-400">
+                              {ses.startTime} - {ses.endTime}
+                            </p>
+                          </div>
+                          {canCreate && ses.status === 'scheduled' && (
+                            <div className="flex items-center gap-1">
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                title="تعديل الموعد"
+                                icon={<Clock className="h-3.5 w-3.5" />}
+                                onClick={() => openReschedule(ses)}
+                              />
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                title="إكمال الحصة"
+                                icon={<CheckCircle2 className="h-3.5 w-3.5 text-emerald-600" />}
+                                onClick={() => void handleSessionStatus(ses, 'completed')}
+                              />
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                title="إلغاء الحصة"
+                                icon={<Ban className="h-3.5 w-3.5 text-red-600" />}
+                                onClick={() => void handleSessionStatus(ses, 'cancelled')}
+                              />
+                            </div>
+                          )}
                         </div>
                       </div>
                     ))}
@@ -255,9 +371,9 @@ export function SessionsPage() {
             </div>
           )}
 
-          {groups.length === 0 ? (
+          {activeGroups.length === 0 ? (
             <p className="text-sm text-amber-700 dark:text-amber-400">
-              يجب إنشاء مجموعة دراسية واحدة على الأقل قبل جدولة الحصص.
+              يجب وجود مجموعة دراسية نشطة واحدة على الأقل قبل جدولة الحصص.
             </p>
           ) : (
             <>
@@ -266,7 +382,7 @@ export function SessionsPage() {
                 value={groupId}
                 onChange={(e) => setGroupId(e.target.value)}
               >
-                {groups.map((g) => (
+                {activeGroups.map((g) => (
                   <option key={g.id} value={g.id}>
                     {g.name} ({g.subject})
                   </option>
@@ -321,13 +437,64 @@ export function SessionsPage() {
             <Button variant="outline" onClick={() => setModalOpen(false)} disabled={submitting}>
               إلغاء
             </Button>
-            {groups.length > 0 && (
+            {activeGroups.length > 0 && (
               <Button type="submit" isLoading={submitting}>
                 حفظ الحصة
               </Button>
             )}
           </div>
         </form>
+      </Modal>
+
+      {/* Reschedule Session Modal */}
+      <Modal
+        isOpen={Boolean(rescheduleTarget)}
+        onClose={() => setRescheduleTarget(null)}
+        title={`إعادة جدولة الحصة — ${rescheduleTarget?.title || ''}`}
+      >
+        {rescheduleTarget && (
+          <form onSubmit={handleReschedule} className="space-y-4">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <Input
+                label="التاريخ الجديد"
+                type="date"
+                dir="ltr"
+                value={rescheduleDate}
+                onChange={(e) => setRescheduleDate(e.target.value)}
+                required
+              />
+              <Input
+                label="من الساعة"
+                type="time"
+                dir="ltr"
+                value={rescheduleStart}
+                onChange={(e) => setRescheduleStart(e.target.value)}
+                required
+              />
+              <Input
+                label="إلى الساعة"
+                type="time"
+                dir="ltr"
+                value={rescheduleEnd}
+                onChange={(e) => setRescheduleEnd(e.target.value)}
+                required
+              />
+            </div>
+            <Input
+              label="سبب تعديل الموعد (اختياري)"
+              value={rescheduleReason}
+              onChange={(e) => setRescheduleReason(e.target.value)}
+            />
+            <div className="pt-3 flex items-center justify-end gap-2.5">
+              <Button variant="outline" onClick={() => setRescheduleTarget(null)} disabled={rescheduling}>
+                إلغاء
+              </Button>
+              <Button type="submit" isLoading={rescheduling}>
+                حفظ الموعد الجديد
+              </Button>
+            </div>
+          </form>
+        )}
       </Modal>
     </AppShell>
   );

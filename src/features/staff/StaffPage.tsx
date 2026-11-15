@@ -18,12 +18,13 @@ import {
   listOrganizationMembers,
   listStaffInvitations,
   revokeStaffInvitation,
+  updateMemberRoleOrStatus,
 } from '@/src/services/staffService';
 import { ROLE_LABELS, ROLE_PERMISSIONS_MATRIX } from '@/src/lib/constants/roles';
 import { EMAIL_PATTERN } from '@/src/lib/firebase/validation';
 import { getArabicErrorMessage } from '@/src/lib/firebase/errors';
 import { formatDateArabic } from '@/src/lib/utils/format';
-import type { MemberRole, OrganizationMember, StaffInvitation } from '@/src/types/domain';
+import type { MemberRole, MemberStatus, OrganizationMember, StaffInvitation } from '@/src/types/domain';
 
 export function StaffPage() {
   const { organization, membership } = useTenant();
@@ -38,6 +39,13 @@ export function StaffPage() {
   const [inviteEmail, setInviteEmail] = useState('');
   const [inviteRole, setInviteRole] = useState<Exclude<MemberRole, 'owner'>>('assistant');
   const [submitting, setSubmitting] = useState(false);
+
+  const [editMember, setEditMember] = useState<OrganizationMember | null>(null);
+  const [editRole, setEditRole] = useState<Exclude<MemberRole, 'owner'>>('assistant');
+  const [editStatus, setEditStatus] = useState<MemberStatus>('active');
+  const [updatingMember, setUpdatingMember] = useState(false);
+
+  const isOwner = membership?.role === 'owner';
 
   const loadStaff = useCallback(async () => {
     if (!organization) return;
@@ -106,6 +114,32 @@ export function StaffPage() {
     }
   };
 
+  const openEditMember = (member: OrganizationMember) => {
+    if (member.role === 'owner') return;
+    setEditMember(member);
+    setEditRole(member.role);
+    setEditStatus(member.status);
+  };
+
+  const handleUpdateMember = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!organization || !editMember || !isOwner || updatingMember) return;
+    setUpdatingMember(true);
+    try {
+      await updateMemberRoleOrStatus(organization.id, editMember.uid, {
+        role: editRole,
+        status: editStatus,
+      });
+      showToast({ type: 'success', title: 'تم تحديث صلاحيات العضو' });
+      setEditMember(null);
+      await loadStaff();
+    } catch (err) {
+      showToast({ type: 'error', title: 'تعذر تحديث العضو', message: getArabicErrorMessage(err) });
+    } finally {
+      setUpdatingMember(false);
+    }
+  };
+
   const memberColumns: DataTableColumn<OrganizationMember>[] = [
     {
       key: 'name',
@@ -137,6 +171,18 @@ export function StaffPage() {
       key: 'joined',
       header: 'تاريخ الانضمام',
       render: (m) => <span className="text-xs text-slate-500">{formatDateArabic(m.createdAt)}</span>,
+    },
+    {
+      key: 'actions',
+      header: 'إدارة',
+      render: (m) =>
+        isOwner && m.role !== 'owner' && m.uid !== membership?.uid ? (
+          <Button size="sm" variant="outline" onClick={() => openEditMember(m)}>
+            تعديل
+          </Button>
+        ) : (
+          <span className="text-xs text-slate-400">—</span>
+        ),
     },
   ];
 
@@ -278,6 +324,42 @@ export function StaffPage() {
             </Button>
           </div>
         </form>
+      </Modal>
+
+      <Modal
+        isOpen={Boolean(editMember)}
+        onClose={() => setEditMember(null)}
+        title={`تعديل صلاحيات العضو — ${editMember?.displayName || ''}`}
+      >
+        {editMember && (
+          <form onSubmit={handleUpdateMember} className="space-y-4">
+            <Select
+              label="الدور الوظيفي"
+              value={editRole}
+              onChange={(e) => setEditRole(e.target.value as Exclude<MemberRole, 'owner'>)}
+            >
+              <option value="teacher">مدرس</option>
+              <option value="assistant">مساعد إداري</option>
+              <option value="accountant">محاسب</option>
+            </Select>
+            <Select
+              label="حالة العضوية"
+              value={editStatus}
+              onChange={(e) => setEditStatus(e.target.value as MemberStatus)}
+            >
+              <option value="active">نشط</option>
+              <option value="suspended">موقوف</option>
+            </Select>
+            <div className="pt-3 flex items-center justify-end gap-2.5">
+              <Button variant="outline" onClick={() => setEditMember(null)} disabled={updatingMember}>
+                إلغاء
+              </Button>
+              <Button type="submit" isLoading={updatingMember}>
+                حفظ التعديلات
+              </Button>
+            </div>
+          </form>
+        )}
       </Modal>
     </AppShell>
   );

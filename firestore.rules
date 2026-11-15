@@ -34,6 +34,14 @@ service cloud.firestore {
       return val is string && val.size() >= minLen && val.size() <= maxLen;
     }
 
+    function isNonNegInt(val) {
+      return val is int && val >= 0;
+    }
+
+    function isPosInt(val) {
+      return val is int && val > 0;
+    }
+
     function hasValidMemberDoc(orgId) {
       return exists(/databases/$(database)/documents/organizations/$(orgId)/members/$(request.auth.uid));
     }
@@ -88,7 +96,9 @@ service cloud.firestore {
         ])
         && data.keys().hasOnly([
           'id', 'name', 'type', 'ownerId', 'ownerName', 'phone', 'email', 'city', 'address',
-          'currency', 'language', 'themePreference', 'academicYear', 'status', 'createdAt', 'updatedAt'
+          'currency', 'language', 'themePreference', 'academicYear', 'status',
+          'totalStudentsCount', 'activeStudentsCount', 'inactiveStudentsCount', 'archivedStudentsCount',
+          'createdAt', 'updatedAt'
         ])
         && data.id == orgId
         && isValidId(data.id)
@@ -105,6 +115,10 @@ service cloud.firestore {
         && data.themePreference in ['light', 'dark', 'system']
         && isStrLen(data.academicYear, 4, 30)
         && data.status in ['active', 'suspended']
+        && (!('totalStudentsCount' in data) || isNonNegInt(data.totalStudentsCount))
+        && (!('activeStudentsCount' in data) || isNonNegInt(data.activeStudentsCount))
+        && (!('inactiveStudentsCount' in data) || isNonNegInt(data.inactiveStudentsCount))
+        && (!('archivedStudentsCount' in data) || isNonNegInt(data.archivedStudentsCount))
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -159,7 +173,7 @@ service cloud.firestore {
         ])
         && data.keys().hasOnly([
           'id', 'organizationId', 'name', 'subject', 'gradeLevel', 'teacherId', 'teacherName',
-          'capacity', 'studentCount', 'scheduleSummary', 'monthlyFee', 'status', 'createdBy', 'createdAt', 'updatedAt'
+          'capacity', 'studentCount', 'lastEnrollmentId', 'scheduleSummary', 'monthlyFee', 'status', 'createdBy', 'createdAt', 'updatedAt'
         ])
         && data.id == groupId
         && isValidId(data.id)
@@ -169,12 +183,38 @@ service cloud.firestore {
         && isStrLen(data.gradeLevel, 1, 60)
         && isValidId(data.teacherId)
         && isStrLen(data.teacherName, 1, 100)
-        && data.capacity is number && data.capacity >= 1 && data.capacity <= 500
-        && data.studentCount is number && data.studentCount >= 0 && data.studentCount <= 500
+        && data.capacity is int && data.capacity >= 1 && data.capacity <= 500
+        && data.studentCount is int && data.studentCount >= 0 && data.studentCount <= data.capacity
+        && (!('lastEnrollmentId' in data) || isValidId(data.lastEnrollmentId))
         && (!('scheduleSummary' in data) || isStrLen(data.scheduleSummary, 0, 150))
         && data.monthlyFee is number && data.monthlyFee >= 0
         && data.status in ['active', 'paused', 'archived']
         && isValidId(data.createdBy)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidEnrollment(data, orgId, enrollmentId) {
+      return data.keys().hasAll([
+          'id', 'organizationId', 'groupId', 'studentId', 'studentName', 'groupName',
+          'status', 'enrolledBy', 'enrolledAt', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'organizationId', 'groupId', 'studentId', 'studentName', 'groupName',
+          'status', 'enrolledBy', 'removedBy', 'enrolledAt', 'removedAt', 'createdAt', 'updatedAt'
+        ])
+        && data.id == enrollmentId
+        && isValidId(data.groupId)
+        && isValidId(data.studentId)
+        && enrollmentId == (data.groupId + '_' + data.studentId)
+        && data.organizationId == orgId
+        && isStrLen(data.studentName, 1, 120)
+        && isStrLen(data.groupName, 1, 120)
+        && data.status in ['active', 'removed']
+        && isValidId(data.enrolledBy)
+        && (!('removedBy' in data) || isValidId(data.removedBy))
+        && data.enrolledAt is timestamp
+        && (!('removedAt' in data) || data.removedAt is timestamp)
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -186,7 +226,8 @@ service cloud.firestore {
         ])
         && data.keys().hasOnly([
           'id', 'organizationId', 'groupId', 'groupName', 'teacherId', 'teacherName',
-          'title', 'date', 'startTime', 'endTime', 'room', 'status', 'createdBy', 'createdAt', 'updatedAt'
+          'title', 'date', 'startTime', 'endTime', 'room', 'status',
+          'cancellationReason', 'rescheduleHistory', 'createdBy', 'createdAt', 'updatedAt'
         ])
         && data.id == sessionId
         && isValidId(data.id)
@@ -197,9 +238,12 @@ service cloud.firestore {
         && isStrLen(data.teacherName, 1, 100)
         && isStrLen(data.title, 2, 150)
         && data.date is string && data.date.size() == 10 && data.date.matches('^\\d{4}-\\d{2}-\\d{2}$')
-        && data.startTime is string && data.startTime.size() == 5 && data.startTime.matches('^\\d{2}:\\d{2}$')
-        && data.endTime is string && data.endTime.size() == 5 && data.endTime.matches('^\\d{2}:\\d{2}$')
+        && data.startTime is string && data.startTime.size() == 5 && data.startTime.matches('^([01]\\d|2[0-3]):[0-5]\\d$')
+        && data.endTime is string && data.endTime.size() == 5 && data.endTime.matches('^([01]\\d|2[0-3]):[0-5]\\d$')
+        && data.endTime > data.startTime
         && (!('room' in data) || isStrLen(data.room, 0, 80))
+        && (!('cancellationReason' in data) || isStrLen(data.cancellationReason, 0, 200))
+        && (!('rescheduleHistory' in data) || (data.rescheduleHistory is list && data.rescheduleHistory.size() <= 20))
         && data.status in ['scheduled', 'completed', 'cancelled']
         && isValidId(data.createdBy)
         && data.createdAt is timestamp
@@ -217,9 +261,10 @@ service cloud.firestore {
         ])
         && data.id == attendanceId
         && isValidId(data.id)
-        && data.organizationId == orgId
         && isValidId(data.sessionId)
         && isValidId(data.studentId)
+        && attendanceId == (data.sessionId + '_' + data.studentId)
+        && data.organizationId == orgId
         && isStrLen(data.studentName, 1, 120)
         && isValidId(data.groupId)
         && data.status in ['present', 'absent', 'late', 'excused']
@@ -235,8 +280,13 @@ service cloud.firestore {
           'currency', 'category', 'method', 'status', 'recordedBy', 'createdAt', 'updatedAt'
         ])
         && data.keys().hasOnly([
-          'id', 'organizationId', 'studentId', 'studentName', 'groupId', 'amount', 'paidAmount', 'dueAmount',
-          'currency', 'category', 'method', 'status', 'referenceNumber', 'notes', 'recordedBy', 'createdAt', 'updatedAt'
+          'id', 'organizationId', 'studentId', 'studentName', 'groupId',
+          'amount', 'paidAmount', 'dueAmount',
+          'amountPiasters', 'paidAmountPiasters', 'dueAmountPiasters',
+          'currency', 'category', 'method', 'status', 'paymentDate',
+          'referenceNumber', 'idempotencyKey', 'notes',
+          'voidReason', 'voidedBy', 'voidedAt',
+          'recordedBy', 'createdAt', 'updatedAt'
         ])
         && data.id == paymentId
         && isValidId(data.id)
@@ -245,14 +295,30 @@ service cloud.firestore {
         && isStrLen(data.studentName, 1, 120)
         && (!('groupId' in data) || isStrLen(data.groupId, 0, 128))
         && data.amount is number && data.amount > 0
-        && data.paidAmount is number && data.paidAmount >= 0
+        && data.paidAmount is number && data.paidAmount >= 0 && data.paidAmount <= data.amount
         && data.dueAmount is number && data.dueAmount >= 0
+        && isPosInt(data.amountPiasters)
+        && isNonNegInt(data.paidAmountPiasters)
+        && isNonNegInt(data.dueAmountPiasters)
+        && data.paidAmountPiasters <= data.amountPiasters
+        && (data.paidAmountPiasters + data.dueAmountPiasters) == data.amountPiasters
         && data.currency == 'EGP'
         && data.category in ['tuition', 'materials', 'registration', 'other']
         && data.method in ['cash', 'vodafone_cash', 'instapay', 'bank_transfer', 'card']
         && data.status in ['posted', 'partial', 'pending', 'voided']
+        && (
+          data.status == 'voided'
+          || (data.status == 'posted' && data.dueAmountPiasters == 0 && data.paidAmountPiasters == data.amountPiasters)
+          || (data.status == 'partial' && data.paidAmountPiasters > 0 && data.dueAmountPiasters > 0)
+          || (data.status == 'pending' && data.paidAmountPiasters == 0 && data.dueAmountPiasters == data.amountPiasters)
+        )
+        && (!('paymentDate' in data) || (data.paymentDate is string && data.paymentDate.matches('^\\d{4}-\\d{2}-\\d{2}$')))
         && (!('referenceNumber' in data) || isStrLen(data.referenceNumber, 0, 80))
+        && (!('idempotencyKey' in data) || isValidId(data.idempotencyKey))
         && (!('notes' in data) || isStrLen(data.notes, 0, 300))
+        && (!('voidReason' in data) || isStrLen(data.voidReason, 3, 200))
+        && (!('voidedBy' in data) || isValidId(data.voidedBy))
+        && (!('voidedAt' in data) || data.voidedAt is timestamp)
         && isValidId(data.recordedBy)
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
@@ -264,8 +330,10 @@ service cloud.firestore {
           'status', 'expenseDate', 'recordedBy', 'createdAt', 'updatedAt'
         ])
         && data.keys().hasOnly([
-          'id', 'organizationId', 'title', 'category', 'amount', 'currency',
-          'status', 'expenseDate', 'notes', 'recordedBy', 'createdAt', 'updatedAt'
+          'id', 'organizationId', 'title', 'category', 'amount', 'amountPiasters', 'currency',
+          'status', 'expenseDate', 'idempotencyKey', 'notes',
+          'voidReason', 'voidedBy', 'voidedAt',
+          'recordedBy', 'createdAt', 'updatedAt'
         ])
         && data.id == expenseId
         && isValidId(data.id)
@@ -273,13 +341,48 @@ service cloud.firestore {
         && isStrLen(data.title, 2, 150)
         && data.category in ['rent', 'salaries', 'utilities', 'printing', 'marketing', 'other']
         && data.amount is number && data.amount > 0
+        && isPosInt(data.amountPiasters)
         && data.currency == 'EGP'
         && data.status in ['posted', 'voided']
         && data.expenseDate is string && data.expenseDate.size() == 10 && data.expenseDate.matches('^\\d{4}-\\d{2}-\\d{2}$')
+        && (!('idempotencyKey' in data) || isValidId(data.idempotencyKey))
         && (!('notes' in data) || isStrLen(data.notes, 0, 300))
+        && (!('voidReason' in data) || isStrLen(data.voidReason, 3, 200))
+        && (!('voidedBy' in data) || isValidId(data.voidedBy))
+        && (!('voidedAt' in data) || data.voidedAt is timestamp)
         && isValidId(data.recordedBy)
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
+    }
+
+    function isValidLedgerEntry(data, orgId, entryId) {
+      return data.keys().hasAll([
+          'id', 'organizationId', 'entryType', 'direction', 'entityType', 'entityId',
+          'amountPiasters', 'amount', 'currency', 'description', 'recordedBy', 'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'organizationId', 'entryType', 'direction', 'entityType', 'entityId',
+          'studentId', 'studentName', 'groupId', 'amountPiasters', 'amount', 'currency',
+          'description', 'relatedEntryId', 'idempotencyKey', 'recordedBy', 'createdAt'
+        ])
+        && data.id == entryId
+        && isValidId(data.id)
+        && data.organizationId == orgId
+        && data.entryType in ['charge', 'payment', 'reversal', 'adjustment']
+        && data.direction in ['debit', 'credit']
+        && data.entityType in ['payment', 'expense']
+        && isValidId(data.entityId)
+        && (!('studentId' in data) || isValidId(data.studentId))
+        && (!('studentName' in data) || isStrLen(data.studentName, 1, 120))
+        && (!('groupId' in data) || isStrLen(data.groupId, 0, 128))
+        && isPosInt(data.amountPiasters)
+        && data.amount is number && data.amount > 0
+        && data.currency == 'EGP'
+        && isStrLen(data.description, 2, 300)
+        && (!('relatedEntryId' in data) || isValidId(data.relatedEntryId))
+        && (!('idempotencyKey' in data) || isValidId(data.idempotencyKey))
+        && isValidId(data.recordedBy)
+        && data.createdAt is timestamp;
     }
 
     function isValidAuditLog(data, orgId, logId) {
@@ -289,7 +392,8 @@ service cloud.firestore {
         ])
         && data.keys().hasOnly([
           'id', 'organizationId', 'actorId', 'actorName', 'actorRole',
-          'action', 'entityType', 'entityId', 'summary', 'createdAt'
+          'action', 'entityType', 'entityId', 'summary',
+          'result', 'correlationId', 'metadata', 'createdAt'
         ])
         && data.id == logId
         && isValidId(data.id)
@@ -301,6 +405,9 @@ service cloud.firestore {
         && isStrLen(data.entityType, 2, 60)
         && isValidId(data.entityId)
         && isStrLen(data.summary, 2, 300)
+        && (!('result' in data) || data.result in ['success', 'denied', 'failure'])
+        && (!('correlationId' in data) || isValidId(data.correlationId))
+        && (!('metadata' in data) || (data.metadata is map && data.metadata.keys().size() <= 10))
         && data.createdAt is timestamp;
     }
 
@@ -369,14 +476,25 @@ service cloud.firestore {
 
       allow update: if isValidId(organizationId)
         && isValidOrganization(incoming(), organizationId)
-        && isOrgOwner(organizationId)
         && incoming().id == existing().id
         && incoming().ownerId == existing().ownerId
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
-        && incoming().diff(existing()).affectedKeys().hasOnly([
-          'name', 'ownerName', 'phone', 'email', 'city', 'address', 'themePreference', 'academicYear', 'updatedAt'
-        ]);
+        && (
+          (
+            isOrgOwner(organizationId)
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'name', 'ownerName', 'phone', 'email', 'city', 'address', 'themePreference', 'academicYear', 'updatedAt'
+            ])
+          )
+          ||
+          (
+            hasAnyRole(organizationId, ['owner', 'teacher', 'assistant', 'accountant'])
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'totalStudentsCount', 'activeStudentsCount', 'inactiveStudentsCount', 'archivedStudentsCount', 'updatedAt'
+            ])
+          )
+        );
 
       allow delete: if false;
 
@@ -463,7 +581,7 @@ service cloud.firestore {
       }
 
       // -----------------------------------------------------------------------
-      // Groups
+      // Groups (studentCount protected against arbitrary client tampering)
       // -----------------------------------------------------------------------
       match /groups/{groupId} {
         allow get: if isValidId(organizationId) && isValidId(groupId) && isActiveMember(organizationId);
@@ -473,6 +591,10 @@ service cloud.firestore {
           && isValidId(groupId)
           && hasAnyRole(organizationId, ['owner', 'teacher', 'assistant'])
           && isValidGroup(incoming(), organizationId, groupId)
+          && incoming().studentCount == 0
+          && exists(/databases/$(database)/documents/organizations/$(organizationId)/members/$(incoming().teacherId))
+          && get(/databases/$(database)/documents/organizations/$(organizationId)/members/$(incoming().teacherId)).data.status == 'active'
+          && get(/databases/$(database)/documents/organizations/$(organizationId)/members/$(incoming().teacherId)).data.role in ['owner', 'teacher']
           && incoming().createdBy == request.auth.uid
           && incoming().createdAt == request.time
           && incoming().updatedAt == request.time;
@@ -480,18 +602,100 @@ service cloud.firestore {
         allow update: if isValidId(organizationId)
           && isValidId(groupId)
           && isValidGroup(incoming(), organizationId, groupId)
-          && hasAnyRole(organizationId, ['owner', 'teacher', 'assistant'])
           && incoming().id == existing().id
           && incoming().organizationId == existing().organizationId
           && incoming().createdBy == existing().createdBy
           && incoming().createdAt == existing().createdAt
           && incoming().updatedAt == request.time
-          && incoming().diff(existing()).affectedKeys().hasOnly([
-            'name', 'subject', 'gradeLevel', 'teacherId', 'teacherName', 'capacity',
-            'studentCount', 'scheduleSummary', 'monthlyFee', 'status', 'updatedAt'
-          ]);
+          && (
+            (
+              hasAnyRole(organizationId, ['owner', 'teacher', 'assistant'])
+              && incoming().studentCount == existing().studentCount
+              && incoming().diff(existing()).affectedKeys().hasOnly([
+                'name', 'subject', 'gradeLevel', 'teacherId', 'teacherName', 'capacity',
+                'scheduleSummary', 'monthlyFee', 'status', 'updatedAt'
+              ])
+            )
+            ||
+            (
+              hasAnyRole(organizationId, ['owner', 'teacher', 'assistant'])
+              && 'lastEnrollmentId' in incoming()
+              && incoming().diff(existing()).affectedKeys().hasOnly(['studentCount', 'lastEnrollmentId', 'updatedAt'])
+              && (
+                (
+                  incoming().studentCount == existing().studentCount + 1
+                  && getAfter(/databases/$(database)/documents/organizations/$(organizationId)/enrollments/$(incoming().lastEnrollmentId)).data.groupId == groupId
+                  && getAfter(/databases/$(database)/documents/organizations/$(organizationId)/enrollments/$(incoming().lastEnrollmentId)).data.status == 'active'
+                )
+                ||
+                (
+                  incoming().studentCount == existing().studentCount - 1
+                  && get(/databases/$(database)/documents/organizations/$(organizationId)/enrollments/$(incoming().lastEnrollmentId)).data.groupId == groupId
+                  && get(/databases/$(database)/documents/organizations/$(organizationId)/enrollments/$(incoming().lastEnrollmentId)).data.status == 'active'
+                  && getAfter(/databases/$(database)/documents/organizations/$(organizationId)/enrollments/$(incoming().lastEnrollmentId)).data.status == 'removed'
+                )
+              )
+            )
+            ||
+            (
+              hasAnyRole(organizationId, ['owner', 'accountant'])
+              && incoming().diff(existing()).affectedKeys().hasOnly(['studentCount', 'updatedAt'])
+            )
+          );
 
         allow delete: if isValidId(organizationId) && isValidId(groupId) && isOrgOwner(organizationId);
+      }
+
+      // -----------------------------------------------------------------------
+      // Group Enrollments (Deterministic {groupId}_{studentId})
+      // -----------------------------------------------------------------------
+      match /enrollments/{enrollmentId} {
+        allow get: if isValidId(organizationId) && isValidId(enrollmentId) && isActiveMember(organizationId);
+        allow list: if isActiveMember(organizationId) && resource.data.organizationId == organizationId;
+
+        allow create: if isValidId(organizationId)
+          && isValidId(enrollmentId)
+          && hasAnyRole(organizationId, ['owner', 'teacher', 'assistant'])
+          && isValidEnrollment(incoming(), organizationId, enrollmentId)
+          && incoming().status == 'active'
+          && incoming().enrolledBy == request.auth.uid
+          && get(/databases/$(database)/documents/organizations/$(organizationId)/groups/$(incoming().groupId)).data.status == 'active'
+          && get(/databases/$(database)/documents/organizations/$(organizationId)/students/$(incoming().studentId)).data.status == 'active'
+          && incoming().enrolledAt == request.time
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+
+        allow update: if isValidId(organizationId)
+          && isValidId(enrollmentId)
+          && hasAnyRole(organizationId, ['owner', 'teacher', 'assistant'])
+          && isValidEnrollment(incoming(), organizationId, enrollmentId)
+          && incoming().id == existing().id
+          && incoming().organizationId == existing().organizationId
+          && incoming().groupId == existing().groupId
+          && incoming().studentId == existing().studentId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            (
+              existing().status == 'active'
+              && incoming().status == 'removed'
+              && incoming().removedBy == request.auth.uid
+              && incoming().removedAt == request.time
+              && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'removedBy', 'removedAt', 'updatedAt'])
+            )
+            ||
+            (
+              existing().status == 'removed'
+              && incoming().status == 'active'
+              && incoming().enrolledBy == request.auth.uid
+              && incoming().enrolledAt == request.time
+              && get(/databases/$(database)/documents/organizations/$(organizationId)/groups/$(incoming().groupId)).data.status == 'active'
+              && get(/databases/$(database)/documents/organizations/$(organizationId)/students/$(incoming().studentId)).data.status == 'active'
+              && incoming().diff(existing()).affectedKeys().hasOnly(['studentName', 'groupName', 'status', 'enrolledBy', 'enrolledAt', 'updatedAt'])
+            )
+          );
+
+        allow delete: if false;
       }
 
       // -----------------------------------------------------------------------
@@ -505,6 +709,10 @@ service cloud.firestore {
           && isValidId(sessionId)
           && hasAnyRole(organizationId, ['owner', 'teacher', 'assistant'])
           && isValidSession(incoming(), organizationId, sessionId)
+          && incoming().status == 'scheduled'
+          && get(/databases/$(database)/documents/organizations/$(organizationId)/groups/$(incoming().groupId)).data.status == 'active'
+          && get(/databases/$(database)/documents/organizations/$(organizationId)/members/$(incoming().teacherId)).data.status == 'active'
+          && get(/databases/$(database)/documents/organizations/$(organizationId)/members/$(incoming().teacherId)).data.role in ['owner', 'teacher']
           && incoming().createdBy == request.auth.uid
           && incoming().createdAt == request.time
           && incoming().updatedAt == request.time;
@@ -514,20 +722,23 @@ service cloud.firestore {
           && isValidSession(incoming(), organizationId, sessionId)
           && hasAnyRole(organizationId, ['owner', 'teacher', 'assistant'])
           && existing().status != 'cancelled'
+          && (existing().status != 'completed' || incoming().status == 'completed')
           && incoming().id == existing().id
           && incoming().organizationId == existing().organizationId
+          && incoming().groupId == existing().groupId
           && incoming().createdBy == existing().createdBy
           && incoming().createdAt == existing().createdAt
           && incoming().updatedAt == request.time
           && incoming().diff(existing()).affectedKeys().hasOnly([
-            'title', 'date', 'startTime', 'endTime', 'room', 'status', 'teacherId', 'teacherName', 'updatedAt'
+            'title', 'date', 'startTime', 'endTime', 'room', 'status',
+            'cancellationReason', 'rescheduleHistory', 'teacherId', 'teacherName', 'updatedAt'
           ]);
 
         allow delete: if isValidId(organizationId) && isValidId(sessionId) && isOrgOwner(organizationId);
       }
 
       // -----------------------------------------------------------------------
-      // Attendance
+      // Attendance (Deterministic {sessionId}_{studentId}, enrolled & non-cancelled only)
       // -----------------------------------------------------------------------
       match /attendance/{attendanceId} {
         allow get: if isValidId(organizationId) && isValidId(attendanceId) && isActiveMember(organizationId);
@@ -537,6 +748,9 @@ service cloud.firestore {
           && isValidId(attendanceId)
           && hasAnyRole(organizationId, ['owner', 'teacher', 'assistant'])
           && isValidAttendance(incoming(), organizationId, attendanceId)
+          && get(/databases/$(database)/documents/organizations/$(organizationId)/sessions/$(incoming().sessionId)).data.status != 'cancelled'
+          && get(/databases/$(database)/documents/organizations/$(organizationId)/sessions/$(incoming().sessionId)).data.groupId == incoming().groupId
+          && get(/databases/$(database)/documents/organizations/$(organizationId)/enrollments/$(incoming().groupId + '_' + incoming().studentId)).data.status == 'active'
           && incoming().recordedBy == request.auth.uid
           && incoming().createdAt == request.time
           && incoming().updatedAt == request.time;
@@ -545,10 +759,12 @@ service cloud.firestore {
           && isValidId(attendanceId)
           && isValidAttendance(incoming(), organizationId, attendanceId)
           && hasAnyRole(organizationId, ['owner', 'teacher', 'assistant'])
+          && get(/databases/$(database)/documents/organizations/$(organizationId)/sessions/$(incoming().sessionId)).data.status != 'cancelled'
           && incoming().id == existing().id
           && incoming().organizationId == existing().organizationId
           && incoming().sessionId == existing().sessionId
           && incoming().studentId == existing().studentId
+          && incoming().groupId == existing().groupId
           && incoming().createdAt == existing().createdAt
           && incoming().updatedAt == request.time
           && incoming().diff(existing()).affectedKeys().hasOnly([
@@ -559,7 +775,7 @@ service cloud.firestore {
       }
 
       // -----------------------------------------------------------------------
-      // Payments (Auditable, never permanently deleted, terminal lock on voided)
+      // Payments (Immutable once posted/voided; settlements only on pending/partial)
       // -----------------------------------------------------------------------
       match /payments/{paymentId} {
         allow get: if isValidId(organizationId) && isValidId(paymentId) && hasAnyRole(organizationId, ['owner', 'accountant', 'assistant']);
@@ -570,6 +786,7 @@ service cloud.firestore {
           && hasAnyRole(organizationId, ['owner', 'accountant', 'assistant'])
           && isValidPayment(incoming(), organizationId, paymentId)
           && incoming().status != 'voided'
+          && exists(/databases/$(database)/documents/organizations/$(organizationId)/students/$(incoming().studentId))
           && incoming().recordedBy == request.auth.uid
           && incoming().createdAt == request.time
           && incoming().updatedAt == request.time;
@@ -577,23 +794,50 @@ service cloud.firestore {
         allow update: if isValidId(organizationId)
           && isValidId(paymentId)
           && isValidPayment(incoming(), organizationId, paymentId)
-          && hasAnyRole(organizationId, ['owner', 'accountant'])
           && existing().status != 'voided'
           && incoming().id == existing().id
           && incoming().organizationId == existing().organizationId
+          && incoming().studentId == existing().studentId
+          && incoming().amount == existing().amount
+          && (!('amountPiasters' in existing()) || incoming().amountPiasters == existing().amountPiasters)
+          && incoming().currency == existing().currency
+          && incoming().category == existing().category
           && incoming().createdAt == existing().createdAt
           && incoming().updatedAt == request.time
           && (
-            (incoming().status in ['posted', 'partial'] && incoming().diff(existing()).affectedKeys().hasOnly(['paidAmount', 'dueAmount', 'status', 'method', 'referenceNumber', 'notes', 'updatedAt']))
+            (
+              existing().status in ['pending', 'partial']
+              && hasAnyRole(organizationId, ['owner', 'accountant', 'assistant'])
+              && incoming().status in ['posted', 'partial']
+              && (!('paidAmountPiasters' in existing()) || incoming().paidAmountPiasters > existing().paidAmountPiasters)
+              && incoming().paidAmount > existing().paidAmount
+              && incoming().diff(existing()).affectedKeys().hasOnly([
+                'amountPiasters', 'paidAmount', 'dueAmount', 'paidAmountPiasters', 'dueAmountPiasters',
+                'status', 'method', 'referenceNumber', 'updatedAt'
+              ])
+            )
             ||
-            (incoming().status == 'voided' && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'notes', 'updatedAt']))
+            (
+              hasAnyRole(organizationId, ['owner', 'accountant'])
+              && incoming().status == 'voided'
+              && incoming().paidAmount == existing().paidAmount
+              && incoming().dueAmount == existing().dueAmount
+              && (!('paidAmountPiasters' in existing()) || incoming().paidAmountPiasters == existing().paidAmountPiasters)
+              && (!('dueAmountPiasters' in existing()) || incoming().dueAmountPiasters == existing().dueAmountPiasters)
+              && incoming().voidedBy == request.auth.uid
+              && incoming().voidedAt == request.time
+              && incoming().diff(existing()).affectedKeys().hasOnly([
+                'amountPiasters', 'paidAmountPiasters', 'dueAmountPiasters',
+                'status', 'voidReason', 'voidedBy', 'voidedAt', 'updatedAt'
+              ])
+            )
           );
 
         allow delete: if false;
       }
 
       // -----------------------------------------------------------------------
-      // Expenses (Auditable, never permanently deleted, terminal lock on voided)
+      // Expenses (Immutable once posted; only voided transition permitted)
       // -----------------------------------------------------------------------
       match /expenses/{expenseId} {
         allow get: if isValidId(organizationId) && isValidId(expenseId) && hasAnyRole(organizationId, ['owner', 'accountant']);
@@ -616,15 +860,66 @@ service cloud.firestore {
           && incoming().status == 'voided'
           && incoming().id == existing().id
           && incoming().organizationId == existing().organizationId
+          && incoming().amount == existing().amount
+          && (!('amountPiasters' in existing()) || incoming().amountPiasters == existing().amountPiasters)
           && incoming().createdAt == existing().createdAt
+          && incoming().voidedBy == request.auth.uid
+          && incoming().voidedAt == request.time
           && incoming().updatedAt == request.time
-          && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'notes', 'updatedAt']);
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'amountPiasters', 'status', 'voidReason', 'voidedBy', 'voidedAt', 'updatedAt'
+          ]);
 
         allow delete: if false;
       }
 
       // -----------------------------------------------------------------------
-      // Audit Logs (Append-only)
+      // Immutable Financial Ledger Entries (Append-Only)
+      // -----------------------------------------------------------------------
+      match /ledgerEntries/{entryId} {
+        allow get: if isValidId(organizationId) && isValidId(entryId) && hasAnyRole(organizationId, ['owner', 'accountant', 'assistant']);
+        allow list: if hasAnyRole(organizationId, ['owner', 'accountant', 'assistant']) && resource.data.organizationId == organizationId;
+
+        allow create: if isValidId(organizationId)
+          && isValidId(entryId)
+          && isValidLedgerEntry(incoming(), organizationId, entryId)
+          && incoming().recordedBy == request.auth.uid
+          && incoming().createdAt == request.time
+          && (
+            (incoming().entityType == 'payment' && incoming().entryType in ['charge', 'payment'] && hasAnyRole(organizationId, ['owner', 'accountant', 'assistant']))
+            ||
+            (hasAnyRole(organizationId, ['owner', 'accountant']))
+          );
+
+        allow update: if false;
+        allow delete: if false;
+      }
+
+      // -----------------------------------------------------------------------
+      // Idempotency Keys (Create-once lock to prevent duplicate financial submissions)
+      // -----------------------------------------------------------------------
+      match /idempotencyKeys/{keyId} {
+        allow get: if isValidId(organizationId) && isValidId(keyId) && hasAnyRole(organizationId, ['owner', 'accountant', 'assistant']);
+        allow list: if false;
+
+        allow create: if isValidId(organizationId)
+          && isValidId(keyId)
+          && hasAnyRole(organizationId, ['owner', 'accountant', 'assistant'])
+          && incoming().keys().hasAll(['id', 'organizationId', 'entityType', 'entityId', 'createdBy', 'createdAt'])
+          && incoming().keys().hasOnly(['id', 'organizationId', 'entityType', 'entityId', 'createdBy', 'createdAt'])
+          && incoming().id == keyId
+          && incoming().organizationId == organizationId
+          && incoming().entityType in ['payment', 'expense']
+          && isValidId(incoming().entityId)
+          && incoming().createdBy == request.auth.uid
+          && incoming().createdAt == request.time;
+
+        allow update: if false;
+        allow delete: if false;
+      }
+
+      // -----------------------------------------------------------------------
+      // Audit Logs (Append-only, actorRole enforced from authoritative membership)
       // -----------------------------------------------------------------------
       match /auditLogs/{logId} {
         allow get: if isValidId(organizationId) && isValidId(logId) && hasAnyRole(organizationId, ['owner', 'accountant']);
@@ -635,7 +930,10 @@ service cloud.firestore {
           && isValidAuditLog(incoming(), organizationId, logId)
           && incoming().createdAt == request.time
           && (
-            isActiveMember(organizationId)
+            (
+              isActiveMember(organizationId)
+              && incoming().actorRole == getMemberData(organizationId).role
+            )
             || (
               isVerifiedUser()
               && incoming().actorRole == 'owner'

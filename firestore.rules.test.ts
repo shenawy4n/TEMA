@@ -111,6 +111,9 @@ async function seedOrganizationsAndUsers() {
       amount: 500,
       paidAmount: 500,
       dueAmount: 0,
+      amountPiasters: 50000,
+      paidAmountPiasters: 50000,
+      dueAmountPiasters: 0,
       currency: 'EGP',
       category: 'tuition',
       method: 'cash',
@@ -126,6 +129,7 @@ async function seedOrganizationsAndUsers() {
       title: 'إيجار القاعة',
       category: 'rent',
       amount: 3000,
+      amountPiasters: 300000,
       currency: 'EGP',
       status: 'posted',
       expenseDate: '2026-11-01',
@@ -449,5 +453,155 @@ describe('TEMA Firestore Security Rules — Emulator Isolation & RBAC Verificati
     });
 
     await assertSucceeds(batch.commit());
+  });
+
+  it('rejects audit log actorRole forgery, arbitrary studentCount tampering, non-deterministic enrollment/attendance IDs, invalid sessions, and ledger mutation', async () => {
+    const ownerACtx = testEnv.authenticatedContext(OWNER_A_UID, {
+      email: 'owner.a@tema.edu.eg',
+      email_verified: true,
+    });
+    const assistantACtx = testEnv.authenticatedContext(ASSISTANT_A_UID, {
+      email: 'assistant.a@tema.edu.eg',
+      email_verified: true,
+    });
+
+    const dbOwner = ownerACtx.firestore();
+    const dbAssistant = assistantACtx.firestore();
+
+    await testEnv.withSecurityRulesDisabled(async (ctx) => {
+      const db = ctx.firestore();
+      await setDoc(doc(db, 'organizations', ORG_ALPHA, 'groups', 'grp_alpha_1'), {
+        id: 'grp_alpha_1',
+        organizationId: ORG_ALPHA,
+        name: 'مجموعة الفيزياء',
+        subject: 'فيزياء',
+        gradeLevel: 'الثالث الثانوي',
+        teacherId: OWNER_A_UID,
+        teacherName: 'أحمد علي',
+        capacity: 30,
+        studentCount: 0,
+        monthlyFee: 350,
+        status: 'active',
+        createdBy: OWNER_A_UID,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      await setDoc(doc(db, 'organizations', ORG_ALPHA, 'sessions', 'ses_cancelled_1'), {
+        id: 'ses_cancelled_1',
+        organizationId: ORG_ALPHA,
+        groupId: 'grp_alpha_1',
+        groupName: 'مجموعة الفيزياء',
+        teacherId: OWNER_A_UID,
+        teacherName: 'أحمد علي',
+        title: 'حصة ملغاة',
+        date: '2026-11-20',
+        startTime: '16:00',
+        endTime: '18:00',
+        status: 'cancelled',
+        createdBy: OWNER_A_UID,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      await setDoc(doc(db, 'organizations', ORG_ALPHA, 'ledgerEntries', 'ldg_1'), {
+        id: 'ldg_1',
+        organizationId: ORG_ALPHA,
+        entryType: 'charge',
+        direction: 'debit',
+        entityType: 'payment',
+        entityId: 'pay_alpha_1',
+        studentId: 'stu_alpha_1',
+        amountPiasters: 50000,
+        amount: 500,
+        currency: 'EGP',
+        description: 'قيد استحقاق',
+        recordedBy: OWNER_A_UID,
+        createdAt: serverTimestamp(),
+      });
+    });
+
+    // 1. Assistant cannot forge actorRole: 'owner' in auditLogs
+    await assertFails(
+      setDoc(doc(dbAssistant, 'organizations', ORG_ALPHA, 'auditLogs', 'log_forged'), {
+        id: 'log_forged',
+        organizationId: ORG_ALPHA,
+        actorId: ASSISTANT_A_UID,
+        actorName: 'سارة محمود',
+        actorRole: 'owner',
+        action: 'student.created',
+        entityType: 'student',
+        entityId: 'stu_alpha_1',
+        summary: 'تزوير الدور الوظيفي',
+        createdAt: serverTimestamp(),
+      })
+    );
+
+    // 2. Assistant cannot arbitrarily tamper with group studentCount
+    await assertFails(
+      updateDoc(doc(dbAssistant, 'organizations', ORG_ALPHA, 'groups', 'grp_alpha_1'), {
+        studentCount: 25,
+        updatedAt: serverTimestamp(),
+      })
+    );
+
+    // 3. Enrollment with non-deterministic ID is rejected
+    await assertFails(
+      setDoc(doc(dbAssistant, 'organizations', ORG_ALPHA, 'enrollments', 'random_id_1'), {
+        id: 'random_id_1',
+        organizationId: ORG_ALPHA,
+        groupId: 'grp_alpha_1',
+        studentId: 'stu_alpha_1',
+        studentName: 'يوسف حسن',
+        groupName: 'مجموعة الفيزياء',
+        status: 'active',
+        enrolledBy: ASSISTANT_A_UID,
+        enrolledAt: serverTimestamp(),
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      })
+    );
+
+    // 4. Session with endTime <= startTime is rejected
+    await assertFails(
+      setDoc(doc(dbOwner, 'organizations', ORG_ALPHA, 'sessions', 'ses_invalid_time'), {
+        id: 'ses_invalid_time',
+        organizationId: ORG_ALPHA,
+        groupId: 'grp_alpha_1',
+        groupName: 'مجموعة الفيزياء',
+        teacherId: OWNER_A_UID,
+        teacherName: 'أحمد علي',
+        title: 'حصة وقت خاطئ',
+        date: '2026-11-21',
+        startTime: '18:00',
+        endTime: '16:00',
+        status: 'scheduled',
+        createdBy: OWNER_A_UID,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      })
+    );
+
+    // 5. Attendance on cancelled session or unenrolled student is rejected
+    await assertFails(
+      setDoc(doc(dbAssistant, 'organizations', ORG_ALPHA, 'attendance', 'ses_cancelled_1_stu_alpha_1'), {
+        id: 'ses_cancelled_1_stu_alpha_1',
+        organizationId: ORG_ALPHA,
+        sessionId: 'ses_cancelled_1',
+        studentId: 'stu_alpha_1',
+        studentName: 'يوسف حسن',
+        groupId: 'grp_alpha_1',
+        status: 'present',
+        recordedBy: ASSISTANT_A_UID,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      })
+    );
+
+    // 6. Ledger entries are strictly append-only (no updates or deletes)
+    await assertFails(
+      updateDoc(doc(dbOwner, 'organizations', ORG_ALPHA, 'ledgerEntries', 'ldg_1'), {
+        amountPiasters: 100,
+      })
+    );
+    await assertFails(deleteDoc(doc(dbOwner, 'organizations', ORG_ALPHA, 'ledgerEntries', 'ldg_1')));
   });
 });

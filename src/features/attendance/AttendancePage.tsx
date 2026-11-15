@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { ClipboardCheck } from 'lucide-react';
+import { ClipboardCheck, CheckCheck } from 'lucide-react';
 import { AppShell } from '@/src/components/layout/AppShell';
 import { PageHeader } from '@/src/components/layout/PageHeader';
+import { Button } from '@/src/components/ui/Button';
 import { Card } from '@/src/components/ui/Card';
 import { Select } from '@/src/components/ui/Select';
 import { EmptyState } from '@/src/components/ui/EmptyState';
@@ -11,10 +12,21 @@ import { useTenant } from '@/src/hooks/useTenant';
 import { useToast } from '@/src/hooks/useToast';
 import { listSessions } from '@/src/services/sessionService';
 import { listStudents } from '@/src/services/studentService';
-import { listAttendanceBySession, upsertAttendanceRecord } from '@/src/services/attendanceService';
+import { listEnrollmentsByGroup } from '@/src/services/groupService';
+import {
+  listAttendanceBySession,
+  markBulkAttendance,
+  upsertAttendanceRecord,
+} from '@/src/services/attendanceService';
 import { getArabicErrorMessage } from '@/src/lib/firebase/errors';
 import { cn } from '@/src/lib/utils/cn';
-import type { AttendanceRecord, AttendanceStatus, ClassSession, Student } from '@/src/types/domain';
+import type {
+  AttendanceRecord,
+  AttendanceStatus,
+  ClassSession,
+  GroupEnrollment,
+  Student,
+} from '@/src/types/domain';
 
 const STATUS_OPTIONS: Array<{ value: AttendanceStatus; label: string }> = [
   { value: 'present', label: 'حاضر' },
@@ -29,10 +41,12 @@ export function AttendancePage() {
 
   const [sessions, setSessions] = useState<ClassSession[]>([]);
   const [students, setStudents] = useState<Student[]>([]);
+  const [groupEnrollments, setGroupEnrollments] = useState<GroupEnrollment[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string>('');
   const [records, setRecords] = useState<AttendanceRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [savingStudentId, setSavingStudentId] = useState<string | null>(null);
+  const [bulkSaving, setBulkSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const canMark = membership ? ['owner', 'teacher', 'assistant'].includes(membership.role) : false;
@@ -46,10 +60,11 @@ export function AttendancePage() {
         listSessions(organization.id),
         listStudents(organization.id),
       ]);
-      setSessions(sesData);
+      const nonCancelled = sesData.filter((s) => s.status !== 'cancelled');
+      setSessions(nonCancelled);
       setStudents(stuData.filter((s) => s.status === 'active'));
-      if (sesData.length > 0 && !selectedSessionId) {
-        setSelectedSessionId(sesData[0].id);
+      if (nonCancelled.length > 0 && !selectedSessionId) {
+        setSelectedSessionId(nonCancelled[0].id);
       }
     } catch (err) {
       setError(getArabicErrorMessage(err));
@@ -62,12 +77,23 @@ export function AttendancePage() {
     void loadInitial();
   }, [loadInitial]);
 
+  const selectedSession = useMemo(
+    () => sessions.find((s) => s.id === selectedSessionId) || null,
+    [sessions, selectedSessionId]
+  );
+
   useEffect(() => {
-    if (!organization || !selectedSessionId) return;
+    if (!organization || !selectedSession) return;
     let active = true;
-    listAttendanceBySession(organization.id, selectedSessionId)
-      .then((data) => {
-        if (active) setRecords(data);
+    Promise.all([
+      listAttendanceBySession(organization.id, selectedSession.id),
+      listEnrollmentsByGroup(organization.id, selectedSession.groupId),
+    ])
+      .then(([attData, enrData]) => {
+        if (active) {
+          setRecords(attData);
+          setGroupEnrollments(enrData);
+        }
       })
       .catch((err) => {
         if (active) showToast({ type: 'error', title: 'تعذر تحميل الحضور', message: getArabicErrorMessage(err) });
@@ -75,12 +101,12 @@ export function AttendancePage() {
     return () => {
       active = false;
     };
-  }, [organization, selectedSessionId, showToast]);
+  }, [organization, selectedSession, showToast]);
 
-  const selectedSession = useMemo(
-    () => sessions.find((s) => s.id === selectedSessionId) || null,
-    [sessions, selectedSessionId]
-  );
+  const enrolledStudents = useMemo(() => {
+    const enrolledIds = new Set(groupEnrollments.filter((e) => e.status === 'active').map((e) => e.studentId));
+    return students.filter((s) => enrolledIds.has(s.id));
+  }, [students, groupEnrollments]);
 
   const recordByStudent = useMemo(() => {
     const map = new Map<string, AttendanceRecord>();
@@ -117,6 +143,25 @@ export function AttendancePage() {
     }
   };
 
+  const handleBulkPresent = async () => {
+    if (!organization || !selectedSession || !canMark || enrolledStudents.length === 0 || bulkSaving) return;
+    setBulkSaving(true);
+    try {
+      await markBulkAttendance(
+        organization.id,
+        selectedSession.id,
+        enrolledStudents.map((s) => ({ studentId: s.id, status: 'present' }))
+      );
+      const updated = await listAttendanceBySession(organization.id, selectedSession.id);
+      setRecords(updated);
+      showToast({ type: 'success', title: `تم تحضير ${enrolledStudents.length} طالب` });
+    } catch (err) {
+      showToast({ type: 'error', title: 'تعذر التحضير الجماعي', message: getArabicErrorMessage(err) });
+    } finally {
+      setBulkSaving(false);
+    }
+  };
+
   return (
     <AppShell
       pageTitle="الحضور والغياب"
@@ -141,32 +186,45 @@ export function AttendancePage() {
         ) : (
           <div className="space-y-5">
             <Card>
-              <div className="max-w-md">
-                <Select
-                  label="اختر الحصة الدراسية"
-                  value={selectedSessionId}
-                  onChange={(e) => setSelectedSessionId(e.target.value)}
-                >
-                  {sessions.map((s) => (
-                    <option key={s.id} value={s.id}>
-                      {s.title} — {s.groupName} ({s.date} · {s.startTime})
-                    </option>
-                  ))}
-                </Select>
+              <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
+                <div className="max-w-md flex-1">
+                  <Select
+                    label="اختر الحصة الدراسية"
+                    value={selectedSessionId}
+                    onChange={(e) => setSelectedSessionId(e.target.value)}
+                  >
+                    {sessions.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.title} — {s.groupName} ({s.date} · {s.startTime})
+                      </option>
+                    ))}
+                  </Select>
+                </div>
+                {canMark && selectedSession && enrolledStudents.length > 0 && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    icon={<CheckCheck className="h-4 w-4" />}
+                    isLoading={bulkSaving}
+                    onClick={() => void handleBulkPresent()}
+                  >
+                    تحضير جميع طلاب المجموعة ({enrolledStudents.length})
+                  </Button>
+                )}
               </div>
             </Card>
 
-            {students.length === 0 ? (
+            {enrolledStudents.length === 0 ? (
               <EmptyState
-                title="لا يوجد طلاب نشطون"
-                description="أضف طلاباً نشطين أولاً لتظهر أسماؤهم في قائمة التحضير."
+                title="لا يوجد طلاب مسجلون في مجموعة هذه الحصة"
+                description="قم بتسجيل الطلاب النشطين في المجموعة من صفحة المجموعات أولاً لتظهر أسماؤهم هنا."
               />
             ) : (
               <Card padding="none">
                 <div className="divide-y divide-slate-200 dark:divide-slate-800">
-                  {students.map((student) => {
+                  {enrolledStudents.map((student) => {
                     const currentStatus = recordByStudent.get(student.id)?.status;
-                    const isSaving = savingStudentId === student.id;
+                    const isSaving = savingStudentId === student.id || bulkSaving;
 
                     return (
                       <div

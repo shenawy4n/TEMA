@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState, type FormEvent } from 'react';
-import { Layers, Plus } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react';
+import { Layers, Plus, UserPlus, UserMinus } from 'lucide-react';
 import { AppShell } from '@/src/components/layout/AppShell';
 import { PageHeader } from '@/src/components/layout/PageHeader';
 import { Button } from '@/src/components/ui/Button';
@@ -12,11 +12,19 @@ import { Input } from '@/src/components/ui/Input';
 import { Select } from '@/src/components/ui/Select';
 import { useTenant } from '@/src/hooks/useTenant';
 import { useToast } from '@/src/hooks/useToast';
-import { createGroup, listGroups } from '@/src/services/groupService';
+import {
+  createGroup,
+  enrollStudentInGroup,
+  listEnrollmentsByGroup,
+  listGroups,
+  removeStudentFromGroup,
+  updateGroupStatus,
+} from '@/src/services/groupService';
+import { listStudents } from '@/src/services/studentService';
 import { GRADE_LEVELS } from '@/src/lib/constants/egypt';
 import { getArabicErrorMessage } from '@/src/lib/firebase/errors';
 import { formatCurrencyEGP, formatNumber } from '@/src/lib/utils/format';
-import type { GroupStatus, StudyGroup } from '@/src/types/domain';
+import type { GroupEnrollment, GroupStatus, Student, StudyGroup } from '@/src/types/domain';
 
 const GROUP_STATUS_LABELS: Record<GroupStatus, string> = {
   active: 'نشطة',
@@ -29,6 +37,7 @@ export function GroupsPage() {
   const { showToast } = useToast();
 
   const [groups, setGroups] = useState<StudyGroup[]>([]);
+  const [students, setStudents] = useState<Student[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -42,6 +51,13 @@ export function GroupsPage() {
   const [formError, setFormError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
+  // Enrollment management modal
+  const [manageGroup, setManageGroup] = useState<StudyGroup | null>(null);
+  const [groupEnrollments, setGroupEnrollments] = useState<GroupEnrollment[]>([]);
+  const [loadingEnrollments, setLoadingEnrollments] = useState(false);
+  const [enrollStudentId, setEnrollStudentId] = useState('');
+  const [enrollmentBusy, setEnrollmentBusy] = useState(false);
+
   const canCreate = membership ? ['owner', 'teacher', 'assistant'].includes(membership.role) : false;
 
   const loadGroups = useCallback(async () => {
@@ -49,8 +65,12 @@ export function GroupsPage() {
     setLoading(true);
     setError(null);
     try {
-      const data = await listGroups(organization.id);
+      const [data, stuData] = await Promise.all([
+        listGroups(organization.id),
+        listStudents(organization.id),
+      ]);
       setGroups(data);
+      setStudents(stuData.filter((s) => s.status === 'active'));
     } catch (err) {
       setError(getArabicErrorMessage(err));
     } finally {
@@ -62,6 +82,78 @@ export function GroupsPage() {
     void loadGroups();
   }, [loadGroups]);
 
+  const loadGroupEnrollments = useCallback(
+    async (group: StudyGroup) => {
+      if (!organization) return;
+      setLoadingEnrollments(true);
+      try {
+        const list = await listEnrollmentsByGroup(organization.id, group.id);
+        setGroupEnrollments(list);
+      } catch (err) {
+        showToast({ type: 'error', title: 'تعذر تحميل تسجيلات المجموعة', message: getArabicErrorMessage(err) });
+      } finally {
+        setLoadingEnrollments(false);
+      }
+    },
+    [organization, showToast]
+  );
+
+  const openManageEnrollments = (group: StudyGroup) => {
+    setManageGroup(group);
+    setEnrollStudentId('');
+    void loadGroupEnrollments(group);
+  };
+
+  const availableStudentsToEnroll = useMemo(() => {
+    const enrolledIds = new Set(groupEnrollments.map((e) => e.studentId));
+    return students.filter((s) => !enrolledIds.has(s.id));
+  }, [students, groupEnrollments]);
+
+  const handleEnrollStudent = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!organization || !manageGroup || !enrollStudentId || enrollmentBusy) return;
+    setEnrollmentBusy(true);
+    try {
+      await enrollStudentInGroup(organization.id, manageGroup.id, enrollStudentId);
+      showToast({ type: 'success', title: 'تم تسجيل الطالب في المجموعة بنجاح' });
+      setEnrollStudentId('');
+      await Promise.all([loadGroupEnrollments(manageGroup), loadGroups()]);
+    } catch (err) {
+      showToast({ type: 'error', title: 'تعذر تسجيل الطالب', message: getArabicErrorMessage(err) });
+    } finally {
+      setEnrollmentBusy(false);
+    }
+  };
+
+  const handleRemoveEnrollment = async (studentId: string) => {
+    if (!organization || !manageGroup || enrollmentBusy) return;
+    setEnrollmentBusy(true);
+    try {
+      await removeStudentFromGroup(organization.id, manageGroup.id, studentId);
+      showToast({ type: 'success', title: 'تمت إزالة الطالب من المجموعة' });
+      await Promise.all([loadGroupEnrollments(manageGroup), loadGroups()]);
+    } catch (err) {
+      showToast({ type: 'error', title: 'تعذر إزالة الطالب', message: getArabicErrorMessage(err) });
+    } finally {
+      setEnrollmentBusy(false);
+    }
+  };
+
+  const handleStatusChange = async (group: StudyGroup, nextStatus: GroupStatus) => {
+    if (!organization || !membership || !canCreate) return;
+    try {
+      await updateGroupStatus(organization.id, group.id, nextStatus, {
+        uid: membership.uid,
+        displayName: membership.displayName,
+        role: membership.role,
+      });
+      showToast({ type: 'success', title: `تم تحديث حالة المجموعة (${GROUP_STATUS_LABELS[nextStatus]})` });
+      await loadGroups();
+    } catch (err) {
+      showToast({ type: 'error', title: 'تعذر تحديث حالة المجموعة', message: getArabicErrorMessage(err) });
+    }
+  };
+
   const handleCreateGroup = async (e: FormEvent) => {
     e.preventDefault();
     if (!organization || !membership || submitting) return;
@@ -71,6 +163,9 @@ export function GroupsPage() {
       setFormError('يرجى إدخال اسم المجموعة والمادة الدراسية.');
       return;
     }
+
+    const parsedCapacity = Number(capacity);
+    const parsedMonthlyFee = Number(monthlyFee);
 
     setSubmitting(true);
     try {
@@ -82,8 +177,8 @@ export function GroupsPage() {
           gradeLevel,
           teacherId: membership.uid,
           teacherName: membership.displayName,
-          capacity: Number(capacity) || 30,
-          monthlyFee: Number(monthlyFee) || 0,
+          capacity: parsedCapacity,
+          monthlyFee: parsedMonthlyFee,
           scheduleSummary,
         },
         {
@@ -143,15 +238,42 @@ export function GroupsPage() {
       key: 'status',
       header: 'الحالة',
       render: (row) => (
-        <span
-          className={
-            row.status === 'active'
-              ? 'text-emerald-700 dark:text-emerald-400 text-xs font-medium'
-              : 'text-amber-700 dark:text-amber-400 text-xs font-medium'
-          }
+        canCreate ? (
+          <Select
+            aria-label={`حالة ${row.name}`}
+            value={row.status}
+            onChange={(e) => void handleStatusChange(row, e.target.value as GroupStatus)}
+            className="text-xs py-1 px-2"
+          >
+            <option value="active">نشطة</option>
+            <option value="paused">متوقفة مؤقتاً</option>
+            <option value="archived">مؤرشفة</option>
+          </Select>
+        ) : (
+          <span
+            className={
+              row.status === 'active'
+                ? 'text-emerald-700 dark:text-emerald-400 text-xs font-medium'
+                : 'text-amber-700 dark:text-amber-400 text-xs font-medium'
+            }
+          >
+            {GROUP_STATUS_LABELS[row.status]}
+          </span>
+        )
+      ),
+    },
+    {
+      key: 'actions',
+      header: 'الطلاب المسجلون',
+      render: (row) => (
+        <Button
+          size="sm"
+          variant="outline"
+          icon={<UserPlus className="h-3.5 w-3.5" />}
+          onClick={() => openManageEnrollments(row)}
         >
-          {GROUP_STATUS_LABELS[row.status]}
-        </span>
+          إدارة ({formatNumber(row.studentCount)})
+        </Button>
       ),
     },
   ];
@@ -273,6 +395,73 @@ export function GroupsPage() {
             </Button>
           </div>
         </form>
+      </Modal>
+
+      {/* Group Enrollments Modal */}
+      <Modal
+        isOpen={Boolean(manageGroup)}
+        onClose={() => setManageGroup(null)}
+        title={`تسجيلات المجموعة — ${manageGroup?.name || ''}`}
+      >
+        {manageGroup && (
+          <div className="space-y-4">
+            {canCreate && manageGroup.status === 'active' && (
+              <form onSubmit={handleEnrollStudent} className="flex items-end gap-2">
+                <div className="flex-1">
+                  <Select
+                    label="تسجيل طالب نشط"
+                    value={enrollStudentId}
+                    onChange={(e) => setEnrollStudentId(e.target.value)}
+                  >
+                    <option value="">اختر طالباً...</option>
+                    {availableStudentsToEnroll.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.fullName} ({s.gradeLevel})
+                      </option>
+                    ))}
+                  </Select>
+                </div>
+                <Button
+                  type="submit"
+                  size="sm"
+                  icon={<UserPlus className="h-4 w-4" />}
+                  isLoading={enrollmentBusy}
+                  disabled={!enrollStudentId}
+                >
+                  تسجيل
+                </Button>
+              </form>
+            )}
+
+            {loadingEnrollments ? (
+              <LoadingState variant="table" />
+            ) : groupEnrollments.length === 0 ? (
+              <EmptyState
+                title="لا يوجد طلاب مسجلون في هذه المجموعة"
+                description="قم بتسجيل الطلاب النشطين في المجموعة للتمكن من تحضيرهم في الحصص."
+              />
+            ) : (
+              <div className="divide-y divide-slate-200 dark:divide-slate-800 max-h-72 overflow-y-auto">
+                {groupEnrollments.map((enr) => (
+                  <div key={enr.id} className="py-2.5 flex items-center justify-between gap-3 text-sm">
+                    <span className="font-medium text-slate-900 dark:text-white">{enr.studentName}</span>
+                    {canCreate && (
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        icon={<UserMinus className="h-3.5 w-3.5" />}
+                        disabled={enrollmentBusy}
+                        onClick={() => void handleRemoveEnrollment(enr.studentId)}
+                      >
+                        إزالة
+                      </Button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </Modal>
     </AppShell>
   );

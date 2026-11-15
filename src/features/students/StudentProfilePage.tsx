@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { ArrowRight, Phone, GraduationCap, UserCheck } from 'lucide-react';
+import { ArrowRight, Phone, GraduationCap, UserCheck, Layers, UserMinus, UserPlus } from 'lucide-react';
 import { AppShell } from '@/src/components/layout/AppShell';
 import { PageHeader } from '@/src/components/layout/PageHeader';
 import { Card } from '@/src/components/ui/Card';
@@ -12,11 +12,26 @@ import { EmptyState } from '@/src/components/ui/EmptyState';
 import { useTenant } from '@/src/hooks/useTenant';
 import { useToast } from '@/src/hooks/useToast';
 import { getStudentById, updateStudentStatus } from '@/src/services/studentService';
+import {
+  enrollStudentInGroup,
+  listEnrollmentsByStudent,
+  listGroups,
+  removeStudentFromGroup,
+} from '@/src/services/groupService';
 import { listAttendanceByStudent } from '@/src/services/attendanceService';
-import { listPaymentsByStudent } from '@/src/services/financeService';
+import { listLedgerEntriesByStudent, listPaymentsByStudent } from '@/src/services/financeService';
+import { deriveStudentLedgerBalance } from '@/src/lib/domain/ledger';
 import { getArabicErrorMessage } from '@/src/lib/firebase/errors';
 import { formatCurrencyEGP, formatDateArabic } from '@/src/lib/utils/format';
-import type { AttendanceRecord, PaymentRecord, Student, StudentStatus } from '@/src/types/domain';
+import type {
+  AttendanceRecord,
+  GroupEnrollment,
+  LedgerEntry,
+  PaymentRecord,
+  Student,
+  StudentStatus,
+  StudyGroup,
+} from '@/src/types/domain';
 
 export function StudentProfilePage() {
   const { studentId } = useParams<{ studentId: string }>();
@@ -26,6 +41,11 @@ export function StudentProfilePage() {
   const [student, setStudent] = useState<Student | null>(null);
   const [attendance, setAttendance] = useState<AttendanceRecord[]>([]);
   const [payments, setPayments] = useState<PaymentRecord[]>([]);
+  const [ledgerEntries, setLedgerEntries] = useState<LedgerEntry[]>([]);
+  const [enrollments, setEnrollments] = useState<GroupEnrollment[]>([]);
+  const [groups, setGroups] = useState<StudyGroup[]>([]);
+  const [selectedGroupId, setSelectedGroupId] = useState('');
+  const [enrollmentBusy, setEnrollmentBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [updatingStatus, setUpdatingStatus] = useState(false);
@@ -41,12 +61,18 @@ export function StudentProfilePage() {
       const stu = await getStudentById(organization.id, studentId);
       setStudent(stu);
       if (stu) {
-        const [attData, payData] = await Promise.all([
+        const [attData, payData, ledgerData, enrData, grpData] = await Promise.all([
           listAttendanceByStudent(organization.id, studentId),
           canViewPayments ? listPaymentsByStudent(organization.id, studentId) : Promise.resolve([]),
+          canViewPayments ? listLedgerEntriesByStudent(organization.id, studentId) : Promise.resolve([]),
+          listEnrollmentsByStudent(organization.id, studentId),
+          listGroups(organization.id),
         ]);
         setAttendance(attData);
         setPayments(payData);
+        setLedgerEntries(ledgerData);
+        setEnrollments(enrData);
+        setGroups(grpData.filter((g) => g.status === 'active'));
       }
     } catch (err) {
       setError(getArabicErrorMessage(err));
@@ -59,6 +85,46 @@ export function StudentProfilePage() {
     void loadProfile();
   }, [loadProfile]);
 
+  const studentBalance = useMemo(() => {
+    if (!student) return null;
+    return deriveStudentLedgerBalance(student.id, ledgerEntries, payments);
+  }, [student, ledgerEntries, payments]);
+
+  const availableGroups = useMemo(() => {
+    const activeIds = new Set(enrollments.map((e) => e.groupId));
+    return groups.filter((g) => !activeIds.has(g.id));
+  }, [groups, enrollments]);
+
+  const handleEnrollInGroup = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!organization || !student || !selectedGroupId || enrollmentBusy) return;
+    setEnrollmentBusy(true);
+    try {
+      await enrollStudentInGroup(organization.id, selectedGroupId, student.id);
+      showToast({ type: 'success', title: 'تم تسجيل الطالب في المجموعة' });
+      setSelectedGroupId('');
+      await loadProfile();
+    } catch (err) {
+      showToast({ type: 'error', title: 'تعذر تسجيل الطالب', message: getArabicErrorMessage(err) });
+    } finally {
+      setEnrollmentBusy(false);
+    }
+  };
+
+  const handleRemoveFromGroup = async (groupId: string) => {
+    if (!organization || !student || enrollmentBusy) return;
+    setEnrollmentBusy(true);
+    try {
+      await removeStudentFromGroup(organization.id, groupId, student.id);
+      showToast({ type: 'success', title: 'تمت إزالة الطالب من المجموعة' });
+      await loadProfile();
+    } catch (err) {
+      showToast({ type: 'error', title: 'تعذر إزالة الطالب', message: getArabicErrorMessage(err) });
+    } finally {
+      setEnrollmentBusy(false);
+    }
+  };
+
   const handleStatusChange = async (nextStatus: StudentStatus) => {
     if (!organization || !membership || !student) return;
     setUpdatingStatus(true);
@@ -68,7 +134,7 @@ export function StudentProfilePage() {
         displayName: membership.displayName,
         role: membership.role,
       });
-      setStudent({ ...student, status: nextStatus });
+      await loadProfile();
       showToast({ type: 'success', title: 'تم تحديث حالة الطالب' });
     } catch (err) {
       showToast({ type: 'error', title: 'تعذر التحديث', message: getArabicErrorMessage(err) });
@@ -174,9 +240,82 @@ export function StudentProfilePage() {
 
             <div className="lg:col-span-2 space-y-6">
               <Card>
-                <h3 className="text-base font-semibold text-slate-900 dark:text-white mb-4">
-                  سجل المدفوعات
-                </h3>
+                <div className="flex items-center justify-between gap-3 mb-4">
+                  <h3 className="text-base font-semibold text-slate-900 dark:text-white inline-flex items-center gap-2">
+                    <Layers className="h-4 w-4 text-slate-500" />
+                    <span>المجموعات المسجل بها</span>
+                  </h3>
+                </div>
+                {canEdit && student.status === 'active' && availableGroups.length > 0 && (
+                  <form onSubmit={handleEnrollInGroup} className="flex items-end gap-2 mb-4">
+                    <div className="flex-1">
+                      <Select
+                        label="إضافة لمجموعة دراسية"
+                        value={selectedGroupId}
+                        onChange={(e) => setSelectedGroupId(e.target.value)}
+                      >
+                        <option value="">اختر مجموعة...</option>
+                        {availableGroups.map((g) => (
+                          <option key={g.id} value={g.id}>
+                            {g.name} ({g.studentCount}/{g.capacity})
+                          </option>
+                        ))}
+                      </Select>
+                    </div>
+                    <Button
+                      type="submit"
+                      size="sm"
+                      icon={<UserPlus className="h-4 w-4" />}
+                      isLoading={enrollmentBusy}
+                      disabled={!selectedGroupId}
+                    >
+                      تسجيل
+                    </Button>
+                  </form>
+                )}
+                {enrollments.length === 0 ? (
+                  <EmptyState
+                    title="غير مسجل في أي مجموعة"
+                    description="سجل الطالب في إحدى المجموعات النشطة ليظهر في قوائم الحضور."
+                  />
+                ) : (
+                  <div className="divide-y divide-slate-200 dark:divide-slate-800">
+                    {enrollments.map((enr) => (
+                      <div key={enr.id} className="py-2.5 flex items-center justify-between text-sm">
+                        <span className="font-medium text-slate-900 dark:text-white">{enr.groupName}</span>
+                        {canEdit && (
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            icon={<UserMinus className="h-3.5 w-3.5" />}
+                            disabled={enrollmentBusy}
+                            onClick={() => void handleRemoveFromGroup(enr.groupId)}
+                          >
+                            إزالة
+                          </Button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </Card>
+
+              <Card>
+                <div className="flex items-center justify-between gap-3 mb-4">
+                  <h3 className="text-base font-semibold text-slate-900 dark:text-white">
+                    سجل المدفوعات
+                  </h3>
+                  {canViewPayments && studentBalance && (
+                    <div className="flex items-center gap-3 text-xs tabular-nums">
+                      <span className="text-emerald-700 dark:text-emerald-400">
+                        محصّل: {formatCurrencyEGP(studentBalance.totalCollectedEgp)}
+                      </span>
+                      <span className="text-amber-600 dark:text-amber-400">
+                        متبقي: {formatCurrencyEGP(studentBalance.outstandingDueEgp)}
+                      </span>
+                    </div>
+                  )}
+                </div>
                 {!canViewPayments ? (
                   <EmptyState
                     title="السجل المالي مقيد"
@@ -194,12 +333,12 @@ export function StudentProfilePage() {
                         <div>
                           <p className="font-medium">{p.category}</p>
                           <p className="text-xs text-slate-500 dark:text-slate-400">
-                            {formatDateArabic(p.createdAt)} · {p.method}
+                            {formatDateArabic(p.createdAt)} · {p.method} {p.status === 'voided' ? '· ملغى' : ''}
                           </p>
                         </div>
                         <div className="text-left tabular-nums">
                           <p className="font-semibold">{formatCurrencyEGP(p.paidAmount)}</p>
-                          {p.dueAmount > 0 && (
+                          {p.dueAmount > 0 && p.status !== 'voided' && (
                             <p className="text-xs text-amber-600 dark:text-amber-400">
                               متبقي: {formatCurrencyEGP(p.dueAmount)}
                             </p>

@@ -1,0 +1,11 @@
+title = "TEMA Gitleaks Security Policy"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Allow Firebase public Web Client SDK identifiers in firebase-applet-config.json and non-secret placeholder examples"
+paths = [
+  '''^firebase-applet-config\.json$''',
+  '''^\.env\.example$''',
+]

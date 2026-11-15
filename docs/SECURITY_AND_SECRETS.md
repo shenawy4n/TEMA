@@ -166,5 +166,17 @@ All CORS allowlists are enforced strictly on the server (`server/app.ts` for Exp
      firebase deploy --only functions:geminiGenerate --project gen-lang-client-0151650891
      ```
    - **If deploying Express (`server.ts`) on Cloud Run / Node**:
-     Set the server environment variable `ALLOWED_ORIGINS="https://app.tema.edu.eg,https://gen-lang-client-0151650891.web.app"` (and `NODE_ENV=production`) in your hosting service's environment configuration.
+     Set the server environment variable `ALLOWED_ORIGINS="https://app.tema.edu.eg,https://gen-lang-client-0151650891.web.app"` (and `NODE_ENV=production`) in your hosting service's environment configuration. `.env.local` is ignored when `NODE_ENV=production`.
    - Never add `*` to `ALLOWED_ORIGINS`, and always include the exact scheme and host (`https://...`, no trailing slash).
+
+---
+
+## 11. Security Verification, Emulator Tests & Serverless Rate-Limiting Limits
+
+- **Cloud Functions Build**: Run `npm --prefix functions install && npm run build:functions` to verify `functions/lib/index.js` compiles cleanly.
+- **Firestore Emulator Security Suite (`firestore.rules.test.ts`)**: Requires Java JRE/JDK (v21+) and Firebase CLI:
+  ```bash
+  npm run test:rules
+  ```
+- **Gitleaks CI Policy (`.gitleaks.toml` & `.github/workflows/security-scan.yml`)**: Scans full Git history (`fetch-depth: 0`) with summary leaks suppressed and allowlists only the public Firebase Web Client SDK identifier in `firebase-applet-config.json` and placeholders in `.env.example`.
+- **Rate Limiting Scope**: Both `server/gemini/security.ts` and `functions/src/index.ts` use per-instance in-memory sliding windows (`20 req / 60s` per `uid:organizationId`). Across scaled Cloud Functions instances (`maxInstances: 10`), use Redis/Firestore atomic counters, Firebase App Check, and Cloud Armor for strict global quota enforcement.

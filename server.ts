@@ -5,7 +5,9 @@ import { fileURLToPath } from 'node:url';
 import { createServer as createViteServer } from 'vite';
 import { createApiApp } from './server/app';
 
-dotenv.config({ path: '.env.local' });
+if (process.env.NODE_ENV !== 'production') {
+  dotenv.config({ path: '.env.local' });
+}
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);

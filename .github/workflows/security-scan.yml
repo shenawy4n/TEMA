@@ -14,18 +14,20 @@ jobs:
     name: Gitleaks Secret Scan
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
+      - name: Checkout full Git history
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Run Gitleaks
+      - name: Run Gitleaks across full Git history and working tree
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+          GITLEAKS_ENABLE_SUMMARY: 'false'
 
   verify-build-and-security-tests:
-    name: TypeScript, Rules Lint, Build & Security Tests
+    name: TypeScript, Functions Build, Rules Lint & Security Tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -37,10 +39,13 @@ jobs:
           node-version: '20'
           cache: 'npm'
 
-      - name: Install dependencies
+      - name: Install root dependencies
         run: npm ci
 
-      - name: Type check
+      - name: Install and build Cloud Functions
+        run: npm --prefix functions ci && npm --prefix functions run build
+
+      - name: Type check frontend and Express server
         run: npm run lint
 
       - name: Lint Firestore security rules
@@ -49,5 +54,5 @@ jobs:
       - name: Build frontend bundle
         run: npm run build
 
-      - name: Run automated security tests
+      - name: Run automated backend & bundle security tests
         run: npm test

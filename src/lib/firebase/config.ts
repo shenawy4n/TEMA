@@ -6,8 +6,13 @@ import {
   doc,
   getDocFromServer,
   type Firestore,
+  type FirestoreSettings,
 } from 'firebase/firestore';
 import firebaseConfig from '../../../firebase-applet-config.json';
+
+type ExtendedFirestoreSettings = FirestoreSettings & {
+  useFetchStreams?: boolean;
+};
 
 export const isFirebaseConfigured = Boolean(
   firebaseConfig &&
@@ -20,15 +25,21 @@ const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
 
 function createFirestoreClient(): Firestore {
   try {
-    // Force XHR long-polling so proxied/throttled networks (where WebChannel streams stall)
-    // connect immediately without hitting the 10-second offline timeout.
-    return initializeFirestore(
-      app,
-      {
+    if (typeof window !== 'undefined') {
+      const browserSettings: ExtendedFirestoreSettings = {
+        // Use classic XHR long-polling instead of Fetch ReadableStream to avoid 10s
+        // WebChannel/stream stalls inside cross-origin iframes and buffered proxies.
         experimentalForceLongPolling: true,
-      },
-      firebaseConfig.firestoreDatabaseId
-    );
+        experimentalLongPollingOptions: { timeoutSeconds: 5 },
+        useFetchStreams: false,
+      };
+      return initializeFirestore(
+        app,
+        browserSettings,
+        firebaseConfig.firestoreDatabaseId
+      );
+    }
+    return getFirestore(app, firebaseConfig.firestoreDatabaseId);
   } catch {
     return getFirestore(app, firebaseConfig.firestoreDatabaseId);
   }

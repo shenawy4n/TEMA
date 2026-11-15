@@ -13,6 +13,10 @@ const allowedOriginsParam = defineString('ALLOWED_ORIGINS', {
   default: 'https://gen-lang-client-0151650891.web.app,https://gen-lang-client-0151650891.firebaseapp.com',
 });
 
+function isLocalhostHost(hostname: string): boolean {
+  return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]';
+}
+
 function parseAllowedOrigins(rawList: string): Set<string> {
   const allowed = new Set<string>();
   for (const item of rawList.split(',')) {
@@ -20,7 +24,8 @@ function parseAllowedOrigins(rawList: string): Set<string> {
     if (!trimmed || trimmed === '*' || trimmed.includes('*')) continue;
     try {
       const parsed = new URL(trimmed);
-      if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
+      // Production Cloud Functions only accept HTTPS origins and never allow localhost
+      if (parsed.protocol === 'https:' && !isLocalhostHost(parsed.hostname)) {
         allowed.add(parsed.origin);
       }
     } catch {
@@ -30,6 +35,7 @@ function parseAllowedOrigins(rawList: string): Set<string> {
   return allowed;
 }
 
+const VALID_ROLES = new Set(['owner', 'teacher', 'assistant', 'accountant']);
 const ALLOWED_KEYS = new Set(['organizationId', 'prompt', 'task']);
 const ALLOWED_TASKS = new Set([
   'general_assistant',
@@ -52,6 +58,8 @@ const SYSTEM_INSTRUCTIONS: Record<string, string> = {
     'أنت مخطط أكاديمي في منصة TEMA. اقترح خطة مراجعة عملية ومختصرة باللغة العربية.',
 };
 
+// NOTE: In-memory per-instance limiter (applies independently per warm container up to maxInstances=10).
+// For strict global quota enforcement at scale, pair with Redis/Firestore counters, App Check, and Cloud Armor.
 const rateHits = new Map<string, number[]>();
 
 function checkRateLimit(key: string, maxRequests = 20, windowMs = 60_000): boolean {
@@ -131,18 +139,23 @@ export const geminiGenerate = onRequest(
     }
 
     const idToken = authHeader.slice('Bearer '.length).trim();
+    if (!idToken || idToken.length > 8192) {
+      res.status(401).json({ error: 'Invalid authentication token.' });
+      return;
+    }
+
     const app = getAdminApp();
 
     let uid: string;
     try {
       const decoded = await getAuth(app).verifyIdToken(idToken, true);
       if (!decoded.email_verified) {
-        res.status(403).json({ error: 'Verified email is required.' });
+        res.status(403).json({ error: 'Email verification is required before using protected operations.' });
         return;
       }
       uid = decoded.uid;
     } catch {
-      res.status(401).json({ error: 'Unauthorized or expired token.' });
+      res.status(401).json({ error: 'Unauthorized or expired session token.' });
       return;
     }
 
@@ -154,20 +167,20 @@ export const geminiGenerate = onRequest(
 
     for (const key of Object.keys(body)) {
       if (!ALLOWED_KEYS.has(key)) {
-        res.status(400).json({ error: `Unexpected field: ${key}` });
+        res.status(400).json({ error: `Unexpected field in request: ${key}` });
         return;
       }
     }
 
     const organizationId = body.organizationId;
     if (typeof organizationId !== 'string' || !ORG_ID_REGEX.test(organizationId)) {
-      res.status(400).json({ error: 'Invalid organizationId.' });
+      res.status(400).json({ error: 'A valid organizationId is required.' });
       return;
     }
 
     const rawPrompt = body.prompt;
     if (typeof rawPrompt !== 'string') {
-      res.status(400).json({ error: 'Prompt must be a string.' });
+      res.status(400).json({ error: 'Prompt must be a non-empty string.' });
       return;
     }
 
@@ -177,13 +190,16 @@ export const geminiGenerate = onRequest(
       return;
     }
     if (prompt.length > MAX_PROMPT_LENGTH) {
-      res.status(413).json({ error: 'Prompt exceeds maximum allowed length.' });
+      res.status(413).json({ error: `Prompt exceeds maximum allowed length of ${MAX_PROMPT_LENGTH} characters.` });
       return;
     }
 
-    const task = typeof body.task === 'string' && ALLOWED_TASKS.has(body.task)
-      ? body.task
-      : 'general_assistant';
+    const rawTask = body.task ?? 'general_assistant';
+    if (typeof rawTask !== 'string' || !ALLOWED_TASKS.has(rawTask)) {
+      res.status(400).json({ error: 'Unsupported AI task type.' });
+      return;
+    }
+    const task = rawTask;
 
     // Authoritative server-side membership check in Firestore
     try {
@@ -196,8 +212,11 @@ export const geminiGenerate = onRequest(
       if (
         !memberSnap.exists ||
         !memberData ||
+        memberData.uid !== uid ||
+        memberData.organizationId !== organizationId ||
         memberData.status !== 'active' ||
-        memberData.organizationId !== organizationId
+        typeof memberData.role !== 'string' ||
+        !VALID_ROLES.has(memberData.role)
       ) {
         res.status(403).json({ error: 'Active organization membership is required.' });
         return;
@@ -209,14 +228,14 @@ export const geminiGenerate = onRequest(
 
     if (!checkRateLimit(`${uid}:${organizationId}`)) {
       res.setHeader('Retry-After', '60');
-      res.status(429).json({ error: 'Rate limit exceeded.' });
+      res.status(429).json({ error: 'Rate limit exceeded. Please wait before sending more requests.' });
       return;
     }
 
     try {
       const apiKey = geminiApiKey.value().trim();
       if (!apiKey) {
-        res.status(503).json({ error: 'AI service is not configured.' });
+        res.status(503).json({ error: 'خدمة الذكاء الاصطناعي غير مهيأة حالياً على الخادم.' });
         return;
       }
 
@@ -242,9 +261,18 @@ export const geminiGenerate = onRequest(
         text: (response.text ?? '').trim(),
         model,
       });
-    } catch {
+    } catch (error) {
       // Never return provider error details, keys, or stack traces
-      res.status(502).json({ error: 'AI generation request failed.' });
+      const msg = error instanceof Error ? error.message.toLowerCase() : '';
+      if (msg.includes('api_key_invalid') || msg.includes('permission_denied') || msg.includes('api key not valid')) {
+        res.status(503).json({ error: 'خدمة الذكاء الاصطناعي غير مهيأة حالياً على الخادم.' });
+        return;
+      }
+      if (msg.includes('resource_exhausted') || msg.includes('429') || msg.includes('quota')) {
+        res.status(429).json({ error: 'تم الوصول إلى الحد المؤقت لطلبات الذكاء الاصطناعي. يرجى المحاولة بعد قليل.' });
+        return;
+      }
+      res.status(502).json({ error: 'تعذر إتمام الطلب عبر خدمة الذكاء الاصطناعي حالياً.' });
     }
   }
 );

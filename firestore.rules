@@ -632,9 +632,24 @@ service cloud.firestore {
 
         allow create: if isValidId(organizationId)
           && isValidId(logId)
-          && isActiveMember(organizationId)
           && isValidAuditLog(incoming(), organizationId, logId)
-          && incoming().createdAt == request.time;
+          && incoming().createdAt == request.time
+          && (
+            isActiveMember(organizationId)
+            || (
+              isVerifiedUser()
+              && incoming().actorRole == 'owner'
+              && incoming().action == 'organization.created'
+              && incoming().entityType == 'organization'
+              && incoming().entityId == organizationId
+              && !exists(/databases/$(database)/documents/organizations/$(organizationId))
+              && existsAfter(/databases/$(database)/documents/organizations/$(organizationId))
+              && getAfter(/databases/$(database)/documents/organizations/$(organizationId)).data.ownerId == request.auth.uid
+              && existsAfter(/databases/$(database)/documents/organizations/$(organizationId)/members/$(request.auth.uid))
+              && getAfter(/databases/$(database)/documents/organizations/$(organizationId)/members/$(request.auth.uid)).data.role == 'owner'
+              && getAfter(/databases/$(database)/documents/organizations/$(organizationId)/members/$(request.auth.uid)).data.status == 'active'
+            )
+          );
 
         allow update: if false;
         allow delete: if false;

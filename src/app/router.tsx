@@ -9,6 +9,7 @@ import { RegisterPage } from '@/src/features/auth/RegisterPage';
 import { ForgotPasswordPage } from '@/src/features/auth/ForgotPasswordPage';
 import { VerifyEmailPage } from '@/src/features/auth/VerifyEmailPage';
 import { UnauthorizedPage } from '@/src/features/auth/UnauthorizedPage';
+import { SuspendedOrganizationPage } from '@/src/features/auth/SuspendedOrganizationPage';
 import { OnboardingWizardPage } from '@/src/features/onboarding/OnboardingWizardPage';
 import { DashboardPage } from '@/src/features/dashboard/DashboardPage';
 import { StudentsPage } from '@/src/features/students/StudentsPage';
@@ -33,12 +34,14 @@ function FullScreenLoading() {
 
 function PublicOnlyRoute({ children }: { children: ReactNode }) {
   const { user, isAuthReady } = useAuth();
-  const { organization, membership, isLoading } = useTenant();
+  const { organization, membership, tenantBlockReason, isLoading } = useTenant();
 
   if (!isAuthReady || (user && isLoading)) return <FullScreenLoading />;
   if (user) {
     if (!user.emailVerified) return <Navigate to="/verify-email" replace />;
-    if (organization && membership) return <Navigate to="/dashboard" replace />;
+    if (tenantBlockReason || (organization && membership)) {
+      return <Navigate to="/dashboard" replace />;
+    }
     return <Navigate to="/onboarding" replace />;
   }
   return <>{children}</>;
@@ -54,12 +57,14 @@ function VerifyEmailRoute() {
 
 function OnboardingRoute() {
   const { user, isAuthReady } = useAuth();
-  const { organization, membership, isLoading } = useTenant();
+  const { organization, membership, tenantBlockReason, isLoading } = useTenant();
 
   if (!isAuthReady || isLoading) return <FullScreenLoading />;
   if (!user) return <Navigate to="/login" replace />;
   if (!user.emailVerified) return <Navigate to="/verify-email" replace />;
-  if (organization && membership) return <Navigate to="/dashboard" replace />;
+  if (tenantBlockReason || (organization && membership)) {
+    return <Navigate to="/dashboard" replace />;
+  }
   return <OnboardingWizardPage />;
 }
 
@@ -71,7 +76,8 @@ function ProtectedRoute({
   allowedRoles?: MemberRole[];
 }) {
   const { user, isAuthReady } = useAuth();
-  const { organization, membership, isLoading, error, refreshTenant } = useTenant();
+  const { organization, membership, tenantBlockReason, isLoading, error, refreshTenant } =
+    useTenant();
 
   if (!isAuthReady || isLoading) return <FullScreenLoading />;
   if (!user) return <Navigate to="/login" replace />;
@@ -85,6 +91,10 @@ function ProtectedRoute({
         </div>
       </div>
     );
+  }
+
+  if (tenantBlockReason) {
+    return <SuspendedOrganizationPage reason={tenantBlockReason} onRefresh={refreshTenant} />;
   }
 
   if (!organization || !membership) {

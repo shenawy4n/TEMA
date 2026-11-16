@@ -24,6 +24,7 @@ import { afterAll, beforeAll, beforeEach, describe, it } from 'vitest';
 const PROJECT_ID = 'gen-lang-client-0151650891';
 const ORG_ALPHA = 'org_alpha';
 const ORG_BETA = 'org_beta';
+const ORG_SUSPENDED = 'org_suspended';
 
 const OWNER_A_UID = 'user_owner_a';
 const ASSISTANT_A_UID = 'user_assistant_a';
@@ -176,6 +177,68 @@ async function seedOrganizationsAndUsers() {
       gradeLevel: 'الثاني الثانوي',
       status: 'active',
       createdBy: OWNER_B_UID,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+
+    // Seed Suspended Org + Active Owner A membership inside it
+    await setDoc(doc(db, 'organizations', ORG_SUSPENDED), {
+      id: ORG_SUSPENDED,
+      name: 'سنتر موقوف',
+      type: 'educational_center',
+      ownerId: OWNER_A_UID,
+      ownerName: 'أحمد علي',
+      phone: '01001234567',
+      email: 'suspended@tema.edu.eg',
+      city: 'القاهرة',
+      currency: 'EGP',
+      language: 'ar',
+      themePreference: 'light',
+      academicYear: '2026-2027',
+      status: 'suspended',
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+
+    await setDoc(doc(db, 'organizations', ORG_SUSPENDED, 'members', OWNER_A_UID), {
+      uid: OWNER_A_UID,
+      organizationId: ORG_SUSPENDED,
+      displayName: 'أحمد علي',
+      email: 'owner.a@tema.edu.eg',
+      role: 'owner',
+      status: 'active',
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+
+    await setDoc(doc(db, 'organizations', ORG_SUSPENDED, 'students', 'stu_susp_1'), {
+      id: 'stu_susp_1',
+      organizationId: ORG_SUSPENDED,
+      fullName: 'طالب منظمة موقوفة',
+      phone: '01088887777',
+      gradeLevel: 'الثالث الثانوي',
+      status: 'active',
+      createdBy: OWNER_A_UID,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+
+    await setDoc(doc(db, 'organizations', ORG_SUSPENDED, 'payments', 'pay_susp_1'), {
+      id: 'pay_susp_1',
+      organizationId: ORG_SUSPENDED,
+      studentId: 'stu_susp_1',
+      studentName: 'طالب منظمة موقوفة',
+      amount: 400,
+      paidAmount: 400,
+      dueAmount: 0,
+      amountPiasters: 40000,
+      paidAmountPiasters: 40000,
+      dueAmountPiasters: 0,
+      currency: 'EGP',
+      category: 'tuition',
+      method: 'cash',
+      status: 'posted',
+      recordedBy: OWNER_A_UID,
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
@@ -603,5 +666,61 @@ describe('TEMA Firestore Security Rules — Emulator Isolation & RBAC Verificati
       })
     );
     await assertFails(deleteDoc(doc(dbOwner, 'organizations', ORG_ALPHA, 'ledgerEntries', 'ldg_1')));
+  });
+
+  it('blocks all access (even active owners) to suspended organizations across root document and subcollections', async () => {
+    const ownerACtx = testEnv.authenticatedContext(OWNER_A_UID, {
+      email: 'owner.a@tema.edu.eg',
+      email_verified: true,
+    });
+    const dbOwner = ownerACtx.firestore();
+
+    // User can read only their own membership doc so client UI can detect suspended status accurately
+    await assertSucceeds(getDoc(doc(dbOwner, 'organizations', ORG_SUSPENDED, 'members', OWNER_A_UID)));
+
+    // Organization root doc & updates are completely blocked when suspended
+    await assertFails(getDoc(doc(dbOwner, 'organizations', ORG_SUSPENDED)));
+    await assertFails(
+      updateDoc(doc(dbOwner, 'organizations', ORG_SUSPENDED), {
+        name: 'محاولة تعديل منظمة موقوفة',
+        updatedAt: serverTimestamp(),
+      })
+    );
+
+    // Subcollection reads, queries, and writes are all blocked when suspended
+    await assertFails(getDoc(doc(dbOwner, 'organizations', ORG_SUSPENDED, 'students', 'stu_susp_1')));
+    await assertFails(
+      getDocs(
+        query(
+          collection(dbOwner, 'organizations', ORG_SUSPENDED, 'students'),
+          where('organizationId', '==', ORG_SUSPENDED)
+        )
+      )
+    );
+    await assertFails(
+      setDoc(doc(dbOwner, 'organizations', ORG_SUSPENDED, 'students', 'stu_susp_new'), {
+        id: 'stu_susp_new',
+        organizationId: ORG_SUSPENDED,
+        fullName: 'طالب جديد غير مسموح',
+        phone: '01077776666',
+        gradeLevel: 'الثالث الثانوي',
+        status: 'active',
+        createdBy: OWNER_A_UID,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      })
+    );
+    await assertFails(getDoc(doc(dbOwner, 'organizations', ORG_SUSPENDED, 'payments', 'pay_susp_1')));
+    await assertFails(
+      getDocs(
+        query(
+          collection(dbOwner, 'organizations', ORG_SUSPENDED, 'members'),
+          where('organizationId', '==', ORG_SUSPENDED)
+        )
+      )
+    );
+
+    // Same user's active organization remains unaffected
+    await assertSucceeds(getDoc(doc(dbOwner, 'organizations', ORG_ALPHA)));
   });
 });

@@ -56,6 +56,8 @@ export function handleFirestoreError(
   throw new Error(JSON.stringify(errInfo));
 }
 
+export { isPermissionDeniedError } from '@/src/lib/domain/tenantAccess';
+
 export function getArabicErrorMessage(error: unknown): string {
   if (error instanceof DomainValidationError) {
     return error.message;

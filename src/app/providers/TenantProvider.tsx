@@ -2,8 +2,15 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState, t
 import { AuthContext } from './AuthProvider';
 import { ensureUserProfile } from '@/src/services/authService';
 import { getOrganization, getOrganizationMembership } from '@/src/services/organizationService';
-import { getArabicErrorMessage } from '@/src/lib/firebase/errors';
-import type { Organization, OrganizationMember, TenantContextValue, UserProfile } from '@/src/types/domain';
+import { getArabicErrorMessage, isPermissionDeniedError } from '@/src/lib/firebase/errors';
+import { resolveTenantAccessState } from '@/src/lib/domain/tenantAccess';
+import type {
+  Organization,
+  OrganizationMember,
+  TenantBlockReason,
+  TenantContextValue,
+  UserProfile,
+} from '@/src/types/domain';
 
 export const TenantContext = createContext<TenantContextValue | null>(null);
 
@@ -16,6 +23,7 @@ export function TenantProvider({ children }: { children: ReactNode }) {
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [organization, setOrganization] = useState<Organization | null>(null);
   const [membership, setMembership] = useState<OrganizationMember | null>(null);
+  const [tenantBlockReason, setTenantBlockReason] = useState<TenantBlockReason>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -25,6 +33,7 @@ export function TenantProvider({ children }: { children: ReactNode }) {
       setUserProfile(null);
       setOrganization(null);
       setMembership(null);
+      setTenantBlockReason(null);
       setError(null);
       setIsLoading(false);
       return;
@@ -32,32 +41,39 @@ export function TenantProvider({ children }: { children: ReactNode }) {
 
     setIsLoading(true);
     setError(null);
+    setTenantBlockReason(null);
 
     try {
       const profile = await ensureUserProfile(user);
       setUserProfile(profile);
 
       if (profile.activeOrganizationId && user.emailVerified) {
-        const [org, member] = await Promise.all([
+        const [orgResult, memberResult] = await Promise.allSettled([
           getOrganization(profile.activeOrganizationId),
           getOrganizationMembership(profile.activeOrganizationId, user.uid),
         ]);
 
-        if (org && member && member.status === 'active') {
-          setOrganization(org);
-          setMembership(member);
-        } else {
-          setOrganization(null);
-          setMembership(null);
-        }
+        const resolved = resolveTenantAccessState({
+          orgResult,
+          memberResult,
+          isPermissionDenied: isPermissionDeniedError,
+          formatError: getArabicErrorMessage,
+        });
+
+        setOrganization(resolved.organization);
+        setMembership(resolved.membership);
+        setTenantBlockReason(resolved.tenantBlockReason);
+        setError(resolved.error);
       } else {
         setOrganization(null);
         setMembership(null);
+        setTenantBlockReason(null);
       }
     } catch (err) {
       setError(getArabicErrorMessage(err));
       setOrganization(null);
       setMembership(null);
+      setTenantBlockReason(null);
     } finally {
       setIsLoading(false);
     }
@@ -72,11 +88,12 @@ export function TenantProvider({ children }: { children: ReactNode }) {
       userProfile,
       organization,
       membership,
+      tenantBlockReason,
       isLoading,
       error,
       refreshTenant: loadTenantState,
     }),
-    [userProfile, organization, membership, isLoading, error, loadTenantState]
+    [userProfile, organization, membership, tenantBlockReason, isLoading, error, loadTenantState]
   );
 
   return <TenantContext.Provider value={value}>{children}</TenantContext.Provider>;

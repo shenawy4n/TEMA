@@ -42,6 +42,18 @@ service cloud.firestore {
       return val is int && val > 0;
     }
 
+    function hasOrgDoc(orgId) {
+      return exists(/databases/$(database)/documents/organizations/$(orgId));
+    }
+
+    function getOrgData(orgId) {
+      return get(/databases/$(database)/documents/organizations/$(orgId)).data;
+    }
+
+    function isActiveOrganization(orgId) {
+      return hasOrgDoc(orgId) && getOrgData(orgId).status == 'active';
+    }
+
     function hasValidMemberDoc(orgId) {
       return exists(/databases/$(database)/documents/organizations/$(orgId)/members/$(request.auth.uid));
     }
@@ -52,6 +64,7 @@ service cloud.firestore {
 
     function isActiveMember(orgId) {
       return isVerifiedUser()
+        && isActiveOrganization(orgId)
         && hasValidMemberDoc(orgId)
         && getMemberData(orgId).status == 'active'
         && getMemberData(orgId).organizationId == orgId;

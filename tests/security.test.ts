@@ -5,6 +5,11 @@ import type { AddressInfo } from 'node:net';
 import type http from 'node:http';
 import { createApiApp } from '../server/app';
 import { SlidingWindowRateLimiter } from '../server/gemini/security';
+import {
+  isPermissionDeniedError,
+  resolveTenantAccessState,
+} from '../src/lib/domain/tenantAccess';
+import type { Organization, OrganizationMember } from '../src/types/domain';
 import firebaseConfig from '../firebase-applet-config.json' with { type: 'json' };
 
 async function withServer(
@@ -431,6 +436,145 @@ describe('TEMA Gemini Backend Security Controls', () => {
       });
       expect(deniedPost.status).toBe(403);
       expect(deniedPost.headers.get('access-control-allow-origin')).toBeNull();
+    });
+  });
+
+  it('10. Firestore rules enforce active organization status and TenantAccess state blocks suspended orgs/memberships', () => {
+    const rulesPath = path.resolve(process.cwd(), 'firestore.rules');
+    const rules = fs.readFileSync(rulesPath, 'utf8');
+
+    expect(rules).toContain('function isActiveOrganization(orgId)');
+    expect(rules).toContain("getOrgData(orgId).status == 'active'");
+    const activeMemberMatch = rules.match(/function isActiveMember\(orgId\)\s*\{[\s\S]*?\}/);
+    expect(activeMemberMatch?.[0]).toContain('isActiveOrganization(orgId)');
+
+    const sampleOrg: Organization = {
+      id: 'org_1',
+      name: 'أكاديمية النور',
+      type: 'educational_center',
+      ownerId: 'uid_owner',
+      ownerName: 'أحمد',
+      phone: '01001234567',
+      email: 'owner@example.com',
+      city: 'القاهرة',
+      currency: 'EGP',
+      language: 'ar',
+      themePreference: 'light',
+      academicYear: '2026-2027',
+      status: 'active',
+      createdAt: null,
+      updatedAt: null,
+    };
+    const activeMember: OrganizationMember = {
+      uid: 'uid_owner',
+      organizationId: 'org_1',
+      displayName: 'أحمد',
+      email: 'owner@example.com',
+      role: 'owner',
+      status: 'active',
+      createdAt: null,
+      updatedAt: null,
+    };
+
+    // Active org + active member grants access
+    expect(
+      resolveTenantAccessState({
+        orgResult: { status: 'fulfilled', value: sampleOrg },
+        memberResult: { status: 'fulfilled', value: activeMember },
+        isPermissionDenied: isPermissionDeniedError,
+        formatError: (e) => String(e),
+      })
+    ).toEqual({
+      organization: sampleOrg,
+      membership: activeMember,
+      tenantBlockReason: null,
+      error: null,
+    });
+
+    // Suspended org doc blocks access cleanly
+    expect(
+      resolveTenantAccessState({
+        orgResult: { status: 'fulfilled', value: { ...sampleOrg, status: 'suspended' } },
+        memberResult: { status: 'fulfilled', value: activeMember },
+        isPermissionDenied: isPermissionDeniedError,
+        formatError: (e) => String(e),
+      })
+    ).toEqual({
+      organization: null,
+      membership: activeMember,
+      tenantBlockReason: 'organization_suspended',
+      error: null,
+    });
+
+    // Permission-denied org read (enforced by firestore.rules when org is suspended) while member doc is active -> organization_suspended
+    const wrappedDenied = new Error(
+      JSON.stringify({
+        error: 'Missing or insufficient permissions.',
+        operationType: 'get',
+        path: 'organizations/org_1',
+      })
+    );
+    expect(isPermissionDeniedError(wrappedDenied)).toBe(true);
+    expect(
+      resolveTenantAccessState({
+        orgResult: { status: 'rejected', reason: wrappedDenied },
+        memberResult: { status: 'fulfilled', value: activeMember },
+        isPermissionDenied: isPermissionDeniedError,
+        formatError: (e) => String(e),
+      })
+    ).toEqual({
+      organization: null,
+      membership: activeMember,
+      tenantBlockReason: 'organization_suspended',
+      error: null,
+    });
+
+    // Suspended membership blocks access cleanly even if org read fails with permission-denied
+    expect(
+      resolveTenantAccessState({
+        orgResult: { status: 'rejected', reason: { code: 'permission-denied' } },
+        memberResult: {
+          status: 'fulfilled',
+          value: { ...activeMember, status: 'suspended' },
+        },
+        isPermissionDenied: isPermissionDeniedError,
+        formatError: (e) => String(e),
+      })
+    ).toEqual({
+      organization: null,
+      membership: { ...activeMember, status: 'suspended' },
+      tenantBlockReason: 'membership_suspended',
+      error: null,
+    });
+
+    // Transient network error preserves error state for retry UI instead of misclassifying as suspended
+    expect(
+      resolveTenantAccessState({
+        orgResult: { status: 'rejected', reason: { code: 'unavailable' } },
+        memberResult: { status: 'fulfilled', value: activeMember },
+        isPermissionDenied: isPermissionDeniedError,
+        formatError: () => 'NETWORK_ERROR',
+      })
+    ).toEqual({
+      organization: null,
+      membership: null,
+      tenantBlockReason: null,
+      error: 'NETWORK_ERROR',
+    });
+
+    // No membership + permission-denied org read routes to onboarding without false block
+    expect(
+      resolveTenantAccessState({
+        orgResult: { status: 'rejected', reason: wrappedDenied },
+        memberResult: { status: 'fulfilled', value: null },
+        isPermissionDenied: isPermissionDeniedError,
+        formatError: (e) => String(e),
+      })
+    ).toEqual({
+      organization: null,
+      membership: null,
+      tenantBlockReason: null,
+      error: null,
     });
   });
 });

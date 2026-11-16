@@ -273,10 +273,13 @@ export interface StaffInvitation {
   updatedAt: unknown;
 }
 
+export type TenantBlockReason = 'organization_suspended' | 'membership_suspended' | null;
+
 export interface TenantContextValue {
   userProfile: UserProfile | null;
   organization: Organization | null;
   membership: OrganizationMember | null;
+  tenantBlockReason: TenantBlockReason;
   isLoading: boolean;
   error: string | null;
   refreshTenant: () => Promise<void>;

@@ -385,17 +385,224 @@ service cloud.firestore {
         && data.direction in ['debit', 'credit']
         && data.entityType in ['payment', 'expense']
         && isValidId(data.entityId)
+        && (
+          (data.entityType == 'payment' && 'studentId' in data && isValidId(data.studentId))
+          ||
+          (data.entityType == 'expense' && !('studentId' in data) && !('groupId' in data) && !('relatedEntryId' in data))
+        )
         && (!('studentId' in data) || isValidId(data.studentId))
         && (!('studentName' in data) || isStrLen(data.studentName, 1, 120))
-        && (!('groupId' in data) || isStrLen(data.groupId, 0, 128))
+        && (!('groupId' in data) || data.groupId == '' || isValidId(data.groupId))
         && isPosInt(data.amountPiasters)
         && data.amount is number && data.amount > 0
+        && math.abs((data.amount * 100) - data.amountPiasters) < 0.001
         && data.currency == 'EGP'
         && isStrLen(data.description, 2, 300)
         && (!('relatedEntryId' in data) || isValidId(data.relatedEntryId))
         && (!('idempotencyKey' in data) || isValidId(data.idempotencyKey))
         && isValidId(data.recordedBy)
         && data.createdAt is timestamp;
+    }
+
+    function hasPaymentDoc(orgId, paymentId) {
+      return exists(/databases/$(database)/documents/organizations/$(orgId)/payments/$(paymentId));
+    }
+
+    function hasPaymentDocAfter(orgId, paymentId) {
+      return existsAfter(/databases/$(database)/documents/organizations/$(orgId)/payments/$(paymentId));
+    }
+
+    function getPaymentBefore(orgId, paymentId) {
+      return get(/databases/$(database)/documents/organizations/$(orgId)/payments/$(paymentId)).data;
+    }
+
+    function getPaymentAfter(orgId, paymentId) {
+      return getAfter(/databases/$(database)/documents/organizations/$(orgId)/payments/$(paymentId)).data;
+    }
+
+    function hasExpenseDoc(orgId, expenseId) {
+      return exists(/databases/$(database)/documents/organizations/$(orgId)/expenses/$(expenseId));
+    }
+
+    function hasExpenseDocAfter(orgId, expenseId) {
+      return existsAfter(/databases/$(database)/documents/organizations/$(orgId)/expenses/$(expenseId));
+    }
+
+    function getExpenseBefore(orgId, expenseId) {
+      return get(/databases/$(database)/documents/organizations/$(orgId)/expenses/$(expenseId)).data;
+    }
+
+    function getExpenseAfter(orgId, expenseId) {
+      return getAfter(/databases/$(database)/documents/organizations/$(orgId)/expenses/$(expenseId)).data;
+    }
+
+    function matchesPaymentGroupId(payData, entryData) {
+      return (
+        ((!('groupId' in payData) || payData.groupId == '') && (!('groupId' in entryData) || entryData.groupId == ''))
+        || ('groupId' in payData && 'groupId' in entryData && payData.groupId == entryData.groupId)
+      );
+    }
+
+    function isValidPaymentCreateChargeLedger(orgId, entryId) {
+      return hasAnyRole(orgId, ['owner', 'accountant', 'assistant'])
+        && incoming().entityType == 'payment'
+        && incoming().entryType == 'charge'
+        && incoming().direction == 'debit'
+        && !('relatedEntryId' in incoming())
+        && entryId == (incoming().entityId + '_charge')
+        && !hasPaymentDoc(orgId, incoming().entityId)
+        && hasPaymentDocAfter(orgId, incoming().entityId)
+        && getPaymentAfter(orgId, incoming().entityId).organizationId == orgId
+        && getPaymentAfter(orgId, incoming().entityId).createdAt == request.time
+        && getPaymentAfter(orgId, incoming().entityId).status != 'voided'
+        && incoming().studentId == getPaymentAfter(orgId, incoming().entityId).studentId
+        && matchesPaymentGroupId(getPaymentAfter(orgId, incoming().entityId), incoming())
+        && incoming().amountPiasters == getPaymentAfter(orgId, incoming().entityId).amountPiasters;
+    }
+
+    function isValidPaymentCreateInitPayLedger(orgId, entryId) {
+      return hasAnyRole(orgId, ['owner', 'accountant', 'assistant'])
+        && incoming().entityType == 'payment'
+        && incoming().entryType == 'payment'
+        && incoming().direction == 'credit'
+        && 'relatedEntryId' in incoming()
+        && incoming().relatedEntryId == (incoming().entityId + '_charge')
+        && entryId == (incoming().entityId + '_pay_init')
+        && !hasPaymentDoc(orgId, incoming().entityId)
+        && hasPaymentDocAfter(orgId, incoming().entityId)
+        && existsAfter(/databases/$(database)/documents/organizations/$(orgId)/ledgerEntries/$(incoming().entityId + '_charge'))
+        && getPaymentAfter(orgId, incoming().entityId).organizationId == orgId
+        && getPaymentAfter(orgId, incoming().entityId).createdAt == request.time
+        && getPaymentAfter(orgId, incoming().entityId).status in ['posted', 'partial']
+        && getPaymentAfter(orgId, incoming().entityId).paidAmountPiasters > 0
+        && incoming().studentId == getPaymentAfter(orgId, incoming().entityId).studentId
+        && matchesPaymentGroupId(getPaymentAfter(orgId, incoming().entityId), incoming())
+        && incoming().amountPiasters == getPaymentAfter(orgId, incoming().entityId).paidAmountPiasters;
+    }
+
+    function isValidPaymentSettlementLedger(orgId, entryId) {
+      return hasAnyRole(orgId, ['owner', 'accountant', 'assistant'])
+        && incoming().entityType == 'payment'
+        && incoming().entryType == 'payment'
+        && incoming().direction == 'credit'
+        && !('relatedEntryId' in incoming())
+        && hasPaymentDoc(orgId, incoming().entityId)
+        && hasPaymentDocAfter(orgId, incoming().entityId)
+        && getPaymentBefore(orgId, incoming().entityId).organizationId == orgId
+        && getPaymentAfter(orgId, incoming().entityId).organizationId == orgId
+        && getPaymentBefore(orgId, incoming().entityId).status in ['pending', 'partial']
+        && getPaymentAfter(orgId, incoming().entityId).status in ['partial', 'posted']
+        && getPaymentAfter(orgId, incoming().entityId).updatedAt == request.time
+        && getPaymentAfter(orgId, incoming().entityId).paidAmountPiasters > 0
+        && (!('paidAmountPiasters' in getPaymentBefore(orgId, incoming().entityId))
+            || getPaymentAfter(orgId, incoming().entityId).paidAmountPiasters > getPaymentBefore(orgId, incoming().entityId).paidAmountPiasters)
+        && incoming().studentId == getPaymentAfter(orgId, incoming().entityId).studentId
+        && matchesPaymentGroupId(getPaymentAfter(orgId, incoming().entityId), incoming())
+        && entryId == (incoming().entityId + '_pay_' + string(getPaymentAfter(orgId, incoming().entityId).paidAmountPiasters))
+        && (
+          ('paidAmountPiasters' in getPaymentBefore(orgId, incoming().entityId)
+            && incoming().amountPiasters == (getPaymentAfter(orgId, incoming().entityId).paidAmountPiasters - getPaymentBefore(orgId, incoming().entityId).paidAmountPiasters))
+          ||
+          (!('paidAmountPiasters' in getPaymentBefore(orgId, incoming().entityId))
+            && math.abs(((getPaymentBefore(orgId, incoming().entityId).paidAmount * 100) + incoming().amountPiasters) - getPaymentAfter(orgId, incoming().entityId).paidAmountPiasters) < 0.5)
+        );
+    }
+
+    function isValidPaymentReversalLedger(orgId, entryId) {
+      return hasAnyRole(orgId, ['owner', 'accountant'])
+        && incoming().entityType == 'payment'
+        && incoming().entryType == 'reversal'
+        && !('relatedEntryId' in incoming())
+        && hasPaymentDoc(orgId, incoming().entityId)
+        && hasPaymentDocAfter(orgId, incoming().entityId)
+        && getPaymentBefore(orgId, incoming().entityId).organizationId == orgId
+        && getPaymentAfter(orgId, incoming().entityId).organizationId == orgId
+        && getPaymentBefore(orgId, incoming().entityId).status != 'voided'
+        && getPaymentAfter(orgId, incoming().entityId).status == 'voided'
+        && getPaymentAfter(orgId, incoming().entityId).voidedAt == request.time
+        && getPaymentAfter(orgId, incoming().entityId).updatedAt == request.time
+        && incoming().studentId == getPaymentAfter(orgId, incoming().entityId).studentId
+        && matchesPaymentGroupId(getPaymentAfter(orgId, incoming().entityId), incoming())
+        && (
+          (
+            entryId == (incoming().entityId + '_rev_charge')
+            && incoming().direction == 'credit'
+            && incoming().amountPiasters == getPaymentAfter(orgId, incoming().entityId).amountPiasters
+          )
+          ||
+          (
+            entryId == (incoming().entityId + '_rev_paid')
+            && incoming().direction == 'debit'
+            && getPaymentAfter(orgId, incoming().entityId).paidAmountPiasters > 0
+            && incoming().amountPiasters == getPaymentAfter(orgId, incoming().entityId).paidAmountPiasters
+          )
+        );
+    }
+
+    function isValidPaymentAdjustmentLedger(orgId, entryId) {
+      return hasAnyRole(orgId, ['owner', 'accountant'])
+        && incoming().entityType == 'payment'
+        && incoming().entryType == 'adjustment'
+        && !('relatedEntryId' in incoming())
+        && 'idempotencyKey' in incoming()
+        && isValidId(incoming().idempotencyKey)
+        && entryId == ('ldg_adj_' + incoming().idempotencyKey)
+        && !exists(/databases/$(database)/documents/organizations/$(orgId)/idempotencyKeys/$(('adj_' + incoming().idempotencyKey)))
+        && existsAfter(/databases/$(database)/documents/organizations/$(orgId)/idempotencyKeys/$(('adj_' + incoming().idempotencyKey)))
+        && getAfter(/databases/$(database)/documents/organizations/$(orgId)/idempotencyKeys/$(('adj_' + incoming().idempotencyKey))).data.entityType == 'ledger_entry'
+        && getAfter(/databases/$(database)/documents/organizations/$(orgId)/idempotencyKeys/$(('adj_' + incoming().idempotencyKey))).data.entityId == entryId
+        && hasPaymentDoc(orgId, incoming().entityId)
+        && getPaymentBefore(orgId, incoming().entityId).organizationId == orgId
+        && getPaymentBefore(orgId, incoming().entityId).status != 'voided'
+        && incoming().studentId == getPaymentBefore(orgId, incoming().entityId).studentId
+        && matchesPaymentGroupId(getPaymentBefore(orgId, incoming().entityId), incoming())
+        && (
+          incoming().direction == 'debit'
+          || (
+            'amountPiasters' in getPaymentBefore(orgId, incoming().entityId)
+            && incoming().amountPiasters <= getPaymentBefore(orgId, incoming().entityId).amountPiasters
+          )
+          || (
+            !('amountPiasters' in getPaymentBefore(orgId, incoming().entityId))
+            && incoming().amount <= getPaymentBefore(orgId, incoming().entityId).amount
+          )
+        );
+    }
+
+    function isValidExpenseLedger(orgId, entryId) {
+      return hasAnyRole(orgId, ['owner', 'accountant'])
+        && incoming().entityType == 'expense'
+        && !('studentId' in incoming())
+        && !('groupId' in incoming())
+        && !('relatedEntryId' in incoming())
+        && (
+          (
+            incoming().entryType == 'charge'
+            && incoming().direction == 'debit'
+            && entryId == (incoming().entityId + '_charge')
+            && !hasExpenseDoc(orgId, incoming().entityId)
+            && hasExpenseDocAfter(orgId, incoming().entityId)
+            && getExpenseAfter(orgId, incoming().entityId).organizationId == orgId
+            && getExpenseAfter(orgId, incoming().entityId).status == 'posted'
+            && getExpenseAfter(orgId, incoming().entityId).createdAt == request.time
+            && incoming().amountPiasters == getExpenseAfter(orgId, incoming().entityId).amountPiasters
+          )
+          ||
+          (
+            incoming().entryType == 'reversal'
+            && incoming().direction == 'credit'
+            && entryId == (incoming().entityId + '_rev_charge')
+            && hasExpenseDoc(orgId, incoming().entityId)
+            && hasExpenseDocAfter(orgId, incoming().entityId)
+            && getExpenseBefore(orgId, incoming().entityId).organizationId == orgId
+            && getExpenseAfter(orgId, incoming().entityId).organizationId == orgId
+            && getExpenseBefore(orgId, incoming().entityId).status != 'voided'
+            && getExpenseAfter(orgId, incoming().entityId).status == 'voided'
+            && getExpenseAfter(orgId, incoming().entityId).voidedAt == request.time
+            && getExpenseAfter(orgId, incoming().entityId).updatedAt == request.time
+            && incoming().amountPiasters == getExpenseAfter(orgId, incoming().entityId).amountPiasters
+          )
+        );
     }
 
     function isValidAuditLog(data, orgId, logId) {
@@ -899,9 +1106,12 @@ service cloud.firestore {
           && incoming().recordedBy == request.auth.uid
           && incoming().createdAt == request.time
           && (
-            (incoming().entityType == 'payment' && incoming().entryType in ['charge', 'payment'] && hasAnyRole(organizationId, ['owner', 'accountant', 'assistant']))
-            ||
-            (hasAnyRole(organizationId, ['owner', 'accountant']))
+            isValidPaymentCreateChargeLedger(organizationId, entryId)
+            || isValidPaymentCreateInitPayLedger(organizationId, entryId)
+            || isValidPaymentSettlementLedger(organizationId, entryId)
+            || isValidPaymentReversalLedger(organizationId, entryId)
+            || isValidPaymentAdjustmentLedger(organizationId, entryId)
+            || isValidExpenseLedger(organizationId, entryId)
           );
 
         allow update: if false;
@@ -909,7 +1119,7 @@ service cloud.firestore {
       }
 
       // -----------------------------------------------------------------------
-      // Idempotency Keys (Create-once lock to prevent duplicate financial submissions)
+      // Idempotency Keys (Create-once lock atomically bound to financial entity)
       // -----------------------------------------------------------------------
       match /idempotencyKeys/{keyId} {
         allow get: if isValidId(organizationId) && isValidId(keyId) && hasAnyRole(organizationId, ['owner', 'accountant', 'assistant']);
@@ -922,10 +1132,28 @@ service cloud.firestore {
           && incoming().keys().hasOnly(['id', 'organizationId', 'entityType', 'entityId', 'createdBy', 'createdAt'])
           && incoming().id == keyId
           && incoming().organizationId == organizationId
-          && incoming().entityType in ['payment', 'expense']
+          && incoming().entityType in ['payment', 'expense', 'ledger_entry']
           && isValidId(incoming().entityId)
           && incoming().createdBy == request.auth.uid
-          && incoming().createdAt == request.time;
+          && incoming().createdAt == request.time
+          && (
+            (
+              incoming().entityType == 'payment'
+              && existsAfter(/databases/$(database)/documents/organizations/$(organizationId)/payments/$(incoming().entityId))
+            )
+            ||
+            (
+              incoming().entityType == 'expense'
+              && hasAnyRole(organizationId, ['owner', 'accountant'])
+              && existsAfter(/databases/$(database)/documents/organizations/$(organizationId)/expenses/$(incoming().entityId))
+            )
+            ||
+            (
+              incoming().entityType == 'ledger_entry'
+              && hasAnyRole(organizationId, ['owner', 'accountant'])
+              && existsAfter(/databases/$(database)/documents/organizations/$(organizationId)/ledgerEntries/$(incoming().entityId))
+            )
+          );
 
         allow update: if false;
         allow delete: if false;

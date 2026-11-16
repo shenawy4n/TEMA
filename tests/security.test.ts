@@ -577,4 +577,42 @@ describe('TEMA Gemini Backend Security Controls', () => {
       error: null,
     });
   });
+
+  it('11. Firestore rules and financial services enforce Step B ledgerEntries parent linkage, amount consistency, and deterministic anti-duplication IDs', () => {
+    const rules = fs.readFileSync(path.resolve(process.cwd(), 'firestore.rules'), 'utf8');
+    const financeService = fs.readFileSync(
+      path.resolve(process.cwd(), 'src/services/financeService.ts'),
+      'utf8'
+    );
+    const temaRoutes = fs.readFileSync(
+      path.resolve(process.cwd(), 'server/api/temaRoutes.ts'),
+      'utf8'
+    );
+
+    // Rules enforce parent transaction linkage, piaster/EGP consistency, and deterministic IDs
+    expect(rules).toContain('math.abs((data.amount * 100) - data.amountPiasters) < 0.001');
+    expect(rules).toContain('function isValidPaymentCreateChargeLedger(orgId, entryId)');
+    expect(rules).toContain('function isValidPaymentCreateInitPayLedger(orgId, entryId)');
+    expect(rules).toContain('function isValidPaymentSettlementLedger(orgId, entryId)');
+    expect(rules).toContain('function isValidPaymentReversalLedger(orgId, entryId)');
+    expect(rules).toContain('function isValidPaymentAdjustmentLedger(orgId, entryId)');
+    expect(rules).toContain('function isValidExpenseLedger(orgId, entryId)');
+    expect(rules).toContain("entryId == (incoming().entityId + '_charge')");
+    expect(rules).toContain("entryId == (incoming().entityId + '_pay_init')");
+    expect(rules).toContain("entryId == (incoming().entityId + '_rev_charge')");
+    expect(rules).toContain("entryId == (incoming().entityId + '_rev_paid')");
+    expect(rules).toContain("entryId == ('ldg_adj_' + incoming().idempotencyKey)");
+
+    // Services and REST routes use matching deterministic IDs instead of unlinked random ldg IDs
+    for (const source of [financeService, temaRoutes]) {
+      expect(source).toContain('`${generatedPaymentId}_charge`'.replace('generatedPaymentId', source.includes('generatedPaymentId') ? 'generatedPaymentId' : 'paymentId'));
+      expect(source).toContain('_pay_init`');
+      expect(source).toContain('_pay_${settlement.newPaidPiasters}`');
+      expect(source).toContain('_rev_charge`');
+      expect(source).toContain('_rev_paid`');
+      expect(source).toContain('${expenseId}_charge`');
+    }
+    expect(financeService).toContain('`${expenseId}_rev_charge`');
+    expect(financeService).toContain('`ldg_adj_${effectiveKey}`');
+  });
 });

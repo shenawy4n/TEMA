@@ -259,7 +259,7 @@ export function createTemaApiRouter(deps: TemaApiDeps): Router {
       }
 
       const paymentId = makeServerId('pay');
-      const chargeEntryId = makeServerId('ldg');
+      const chargeEntryId = `${paymentId}_charge`;
       const writes: RestWriteInstruction[] = [
         {
           type: 'set',
@@ -313,7 +313,7 @@ export function createTemaApiRouter(deps: TemaApiDeps): Router {
       ];
 
       if (validated.paidAmountPiasters > 0) {
-        const payEntryId = makeServerId('ldg');
+        const payEntryId = `${paymentId}_pay_init`;
         writes.push({
           type: 'set',
           path: `organizations/${ctx.orgId}/ledgerEntries/${payEntryId}`,
@@ -408,7 +408,7 @@ export function createTemaApiRouter(deps: TemaApiDeps): Router {
           method
         );
 
-        const entryId = makeServerId('ldg');
+        const entryId = `${paymentId}_pay_${settlement.newPaidPiasters}`;
         const installmentEgp = piastersToEgp(settlement.installmentPiasters);
 
         await deps.store.commitWrites(
@@ -513,7 +513,8 @@ export function createTemaApiRouter(deps: TemaApiDeps): Router {
 
         const totalPiasters = resolveRecordPiasters(existing.amountPiasters, existing.amount);
         const paidPiasters = resolveRecordPiasters(existing.paidAmountPiasters, existing.paidAmount);
-        const chargeReversalId = makeServerId('ldg');
+        const duePiasters = Math.max(0, totalPiasters - paidPiasters);
+        const chargeReversalId = `${paymentId}_rev_charge`;
 
         const writes: RestWriteInstruction[] = [
           {
@@ -525,6 +526,13 @@ export function createTemaApiRouter(deps: TemaApiDeps): Router {
               voidedBy: ctx.member.uid,
               voidedAt: SERVER_TIMESTAMP_SENTINEL,
               updatedAt: SERVER_TIMESTAMP_SENTINEL,
+              ...(typeof existing.amountPiasters !== 'number'
+                ? {
+                    amountPiasters: totalPiasters,
+                    paidAmountPiasters: paidPiasters,
+                    dueAmountPiasters: duePiasters,
+                  }
+                : {}),
             },
           },
           {
@@ -551,7 +559,7 @@ export function createTemaApiRouter(deps: TemaApiDeps): Router {
         ];
 
         if (paidPiasters > 0) {
-          const payReversalId = makeServerId('ldg');
+          const payReversalId = `${paymentId}_rev_paid`;
           writes.push({
             type: 'set',
             path: `organizations/${ctx.orgId}/ledgerEntries/${payReversalId}`,
@@ -615,7 +623,7 @@ export function createTemaApiRouter(deps: TemaApiDeps): Router {
       });
 
       const expenseId = makeServerId('exp');
-      const entryId = makeServerId('ldg');
+      const entryId = `${expenseId}_charge`;
       const writes: RestWriteInstruction[] = [
         {
           type: 'set',

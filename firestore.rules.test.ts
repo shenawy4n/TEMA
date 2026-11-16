@@ -723,4 +723,470 @@ describe('TEMA Firestore Security Rules — Emulator Isolation & RBAC Verificati
     // Same user's active organization remains unaffected
     await assertSucceeds(getDoc(doc(dbOwner, 'organizations', ORG_ALPHA)));
   });
+
+  it('enforces Step B ledgerEntries security: rejects orphan/duplicate/tampered ledger entries while preserving atomic payment, settlement, void, expense, and adjustment flows', async () => {
+    const ownerACtx = testEnv.authenticatedContext(OWNER_A_UID, {
+      email: 'owner.a@tema.edu.eg',
+      email_verified: true,
+    });
+    const assistantACtx = testEnv.authenticatedContext(ASSISTANT_A_UID, {
+      email: 'assistant.a@tema.edu.eg',
+      email_verified: true,
+    });
+
+    const dbOwner = ownerACtx.firestore();
+    const dbAssistant = assistantACtx.firestore();
+
+    // 1. Direct standalone ledger entry pointing to non-existent payment/expense is REJECTED (even for owner)
+    await assertFails(
+      setDoc(doc(dbOwner, 'organizations', ORG_ALPHA, 'ledgerEntries', 'pay_missing_charge'), {
+        id: 'pay_missing_charge',
+        organizationId: ORG_ALPHA,
+        entryType: 'charge',
+        direction: 'debit',
+        entityType: 'payment',
+        entityId: 'pay_missing',
+        studentId: 'stu_alpha_1',
+        studentName: 'يوسف حسن',
+        amountPiasters: 50000,
+        amount: 500,
+        currency: 'EGP',
+        description: 'قيد مالي مزور بدون فاتورة',
+        recordedBy: OWNER_A_UID,
+        createdAt: serverTimestamp(),
+      })
+    );
+
+    // 2. Direct standalone ledger entry referencing already-existing pay_alpha_1 outside atomic batch is REJECTED
+    await assertFails(
+      setDoc(doc(dbOwner, 'organizations', ORG_ALPHA, 'ledgerEntries', 'pay_alpha_1_charge'), {
+        id: 'pay_alpha_1_charge',
+        organizationId: ORG_ALPHA,
+        entryType: 'charge',
+        direction: 'debit',
+        entityType: 'payment',
+        entityId: 'pay_alpha_1',
+        studentId: 'stu_alpha_1',
+        studentName: 'يوسف حسن',
+        amountPiasters: 50000,
+        amount: 500,
+        currency: 'EGP',
+        description: 'محاولة إعادة حقن قيد استحقاق',
+        recordedBy: OWNER_A_UID,
+        createdAt: serverTimestamp(),
+      })
+    );
+
+    // 3. Atomic payment creation with random/duplicate ledger ID is REJECTED
+    const nonDeterministicBatch = writeBatch(dbAssistant);
+    nonDeterministicBatch.set(doc(dbAssistant, 'organizations', ORG_ALPHA, 'payments', 'pay_nondet_1'), {
+      id: 'pay_nondet_1',
+      organizationId: ORG_ALPHA,
+      studentId: 'stu_alpha_1',
+      studentName: 'يوسف حسن',
+      groupId: '',
+      amount: 500,
+      paidAmount: 200,
+      dueAmount: 300,
+      amountPiasters: 50000,
+      paidAmountPiasters: 20000,
+      dueAmountPiasters: 30000,
+      currency: 'EGP',
+      category: 'tuition',
+      method: 'cash',
+      status: 'partial',
+      recordedBy: ASSISTANT_A_UID,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    nonDeterministicBatch.set(
+      doc(dbAssistant, 'organizations', ORG_ALPHA, 'ledgerEntries', 'ldg_random_spoof'),
+      {
+        id: 'ldg_random_spoof',
+        organizationId: ORG_ALPHA,
+        entryType: 'charge',
+        direction: 'debit',
+        entityType: 'payment',
+        entityId: 'pay_nondet_1',
+        studentId: 'stu_alpha_1',
+        amountPiasters: 50000,
+        amount: 500,
+        currency: 'EGP',
+        description: 'معرف عشوائي مكرر',
+        recordedBy: ASSISTANT_A_UID,
+        createdAt: serverTimestamp(),
+      }
+    );
+    await assertFails(nonDeterministicBatch.commit());
+
+    // 4. Atomic partial payment creation with mismatched ledger amount is REJECTED
+    const mismatchedAmountBatch = writeBatch(dbAssistant);
+    mismatchedAmountBatch.set(doc(dbAssistant, 'organizations', ORG_ALPHA, 'payments', 'pay_mismatch_1'), {
+      id: 'pay_mismatch_1',
+      organizationId: ORG_ALPHA,
+      studentId: 'stu_alpha_1',
+      studentName: 'يوسف حسن',
+      groupId: '',
+      amount: 500,
+      paidAmount: 0,
+      dueAmount: 500,
+      amountPiasters: 50000,
+      paidAmountPiasters: 0,
+      dueAmountPiasters: 50000,
+      currency: 'EGP',
+      category: 'tuition',
+      method: 'cash',
+      status: 'pending',
+      recordedBy: ASSISTANT_A_UID,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    mismatchedAmountBatch.set(
+      doc(dbAssistant, 'organizations', ORG_ALPHA, 'ledgerEntries', 'pay_mismatch_1_charge'),
+      {
+        id: 'pay_mismatch_1_charge',
+        organizationId: ORG_ALPHA,
+        entryType: 'charge',
+        direction: 'debit',
+        entityType: 'payment',
+        entityId: 'pay_mismatch_1',
+        studentId: 'stu_alpha_1',
+        amountPiasters: 10000,
+        amount: 100,
+        currency: 'EGP',
+        description: 'مبلغ قيد غير مطابق للفاتورة',
+        recordedBy: ASSISTANT_A_UID,
+        createdAt: serverTimestamp(),
+      }
+    );
+    await assertFails(mismatchedAmountBatch.commit());
+
+    // 5. Valid atomic partial payment creation by assistant SUCCEEDS
+    const validCreateBatch = writeBatch(dbAssistant);
+    validCreateBatch.set(doc(dbAssistant, 'organizations', ORG_ALPHA, 'payments', 'pay_flow_1'), {
+      id: 'pay_flow_1',
+      organizationId: ORG_ALPHA,
+      studentId: 'stu_alpha_1',
+      studentName: 'يوسف حسن',
+      groupId: '',
+      amount: 500,
+      paidAmount: 200,
+      dueAmount: 300,
+      amountPiasters: 50000,
+      paidAmountPiasters: 20000,
+      dueAmountPiasters: 30000,
+      currency: 'EGP',
+      category: 'tuition',
+      method: 'cash',
+      status: 'partial',
+      recordedBy: ASSISTANT_A_UID,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    validCreateBatch.set(
+      doc(dbAssistant, 'organizations', ORG_ALPHA, 'ledgerEntries', 'pay_flow_1_charge'),
+      {
+        id: 'pay_flow_1_charge',
+        organizationId: ORG_ALPHA,
+        entryType: 'charge',
+        direction: 'debit',
+        entityType: 'payment',
+        entityId: 'pay_flow_1',
+        studentId: 'stu_alpha_1',
+        studentName: 'يوسف حسن',
+        groupId: '',
+        amountPiasters: 50000,
+        amount: 500,
+        currency: 'EGP',
+        description: 'استحقاق مالي للطالب',
+        recordedBy: ASSISTANT_A_UID,
+        createdAt: serverTimestamp(),
+      }
+    );
+    validCreateBatch.set(
+      doc(dbAssistant, 'organizations', ORG_ALPHA, 'ledgerEntries', 'pay_flow_1_pay_init'),
+      {
+        id: 'pay_flow_1_pay_init',
+        organizationId: ORG_ALPHA,
+        entryType: 'payment',
+        direction: 'credit',
+        entityType: 'payment',
+        entityId: 'pay_flow_1',
+        studentId: 'stu_alpha_1',
+        studentName: 'يوسف حسن',
+        groupId: '',
+        amountPiasters: 20000,
+        amount: 200,
+        currency: 'EGP',
+        relatedEntryId: 'pay_flow_1_charge',
+        description: 'تحصيل دفعة أولى',
+        recordedBy: ASSISTANT_A_UID,
+        createdAt: serverTimestamp(),
+      }
+    );
+    await assertSucceeds(validCreateBatch.commit());
+
+    // 6. Assistant CANNOT create a payment adjustment (owner/accountant only)
+    const assistantAdjBatch = writeBatch(dbAssistant);
+    assistantAdjBatch.set(
+      doc(dbAssistant, 'organizations', ORG_ALPHA, 'ledgerEntries', 'ldg_adj_ass_1'),
+      {
+        id: 'ldg_adj_ass_1',
+        organizationId: ORG_ALPHA,
+        entryType: 'adjustment',
+        direction: 'credit',
+        entityType: 'payment',
+        entityId: 'pay_flow_1',
+        studentId: 'stu_alpha_1',
+        groupId: '',
+        amountPiasters: 5000,
+        amount: 50,
+        currency: 'EGP',
+        idempotencyKey: 'ass_1',
+        description: 'خصم غير مصرح من مساعد',
+        recordedBy: ASSISTANT_A_UID,
+        createdAt: serverTimestamp(),
+      }
+    );
+    assistantAdjBatch.set(doc(dbAssistant, 'organizations', ORG_ALPHA, 'idempotencyKeys', 'adj_ass_1'), {
+      id: 'adj_ass_1',
+      organizationId: ORG_ALPHA,
+      entityType: 'ledger_entry',
+      entityId: 'ldg_adj_ass_1',
+      createdBy: ASSISTANT_A_UID,
+      createdAt: serverTimestamp(),
+    });
+    await assertFails(assistantAdjBatch.commit());
+
+    // 7. Owner valid adjustment WITH idempotencyKeys lock SUCCEEDS, duplicate replay FAILS, and over-credit FAILS
+    const ownerAdjBatch = writeBatch(dbOwner);
+    ownerAdjBatch.set(doc(dbOwner, 'organizations', ORG_ALPHA, 'ledgerEntries', 'ldg_adj_ok_1'), {
+      id: 'ldg_adj_ok_1',
+      organizationId: ORG_ALPHA,
+      entryType: 'adjustment',
+      direction: 'credit',
+      entityType: 'payment',
+      entityId: 'pay_flow_1',
+      studentId: 'stu_alpha_1',
+      groupId: '',
+      amountPiasters: 5000,
+      amount: 50,
+      currency: 'EGP',
+      idempotencyKey: 'ok_1',
+      description: 'خصم معتمد من المالك',
+      recordedBy: OWNER_A_UID,
+      createdAt: serverTimestamp(),
+    });
+    ownerAdjBatch.set(doc(dbOwner, 'organizations', ORG_ALPHA, 'idempotencyKeys', 'adj_ok_1'), {
+      id: 'adj_ok_1',
+      organizationId: ORG_ALPHA,
+      entityType: 'ledger_entry',
+      entityId: 'ldg_adj_ok_1',
+      createdBy: OWNER_A_UID,
+      createdAt: serverTimestamp(),
+    });
+    await assertSucceeds(ownerAdjBatch.commit());
+
+    const replayAdjBatch = writeBatch(dbOwner);
+    replayAdjBatch.set(doc(dbOwner, 'organizations', ORG_ALPHA, 'ledgerEntries', 'ldg_adj_ok_1'), {
+      id: 'ldg_adj_ok_1',
+      organizationId: ORG_ALPHA,
+      entryType: 'adjustment',
+      direction: 'credit',
+      entityType: 'payment',
+      entityId: 'pay_flow_1',
+      studentId: 'stu_alpha_1',
+      groupId: '',
+      amountPiasters: 5000,
+      amount: 50,
+      currency: 'EGP',
+      idempotencyKey: 'ok_1',
+      description: 'تكرار تسوية',
+      recordedBy: OWNER_A_UID,
+      createdAt: serverTimestamp(),
+    });
+    await assertFails(replayAdjBatch.commit());
+
+    // 8. Valid atomic settlement by assistant SUCCEEDS
+    const validSettleBatch = writeBatch(dbAssistant);
+    validSettleBatch.update(doc(dbAssistant, 'organizations', ORG_ALPHA, 'payments', 'pay_flow_1'), {
+      paidAmount: 500,
+      dueAmount: 0,
+      paidAmountPiasters: 50000,
+      dueAmountPiasters: 0,
+      status: 'posted',
+      method: 'instapay',
+      referenceNumber: 'INSTA-123',
+      updatedAt: serverTimestamp(),
+    });
+    validSettleBatch.set(
+      doc(dbAssistant, 'organizations', ORG_ALPHA, 'ledgerEntries', 'pay_flow_1_pay_50000'),
+      {
+        id: 'pay_flow_1_pay_50000',
+        organizationId: ORG_ALPHA,
+        entryType: 'payment',
+        direction: 'credit',
+        entityType: 'payment',
+        entityId: 'pay_flow_1',
+        studentId: 'stu_alpha_1',
+        studentName: 'يوسف حسن',
+        groupId: '',
+        amountPiasters: 30000,
+        amount: 300,
+        currency: 'EGP',
+        description: 'سداد القسط المتبقي',
+        recordedBy: ASSISTANT_A_UID,
+        createdAt: serverTimestamp(),
+      }
+    );
+    await assertSucceeds(validSettleBatch.commit());
+
+    // 9. Valid atomic payment void + reversals by owner SUCCEEDS
+    const validVoidBatch = writeBatch(dbOwner);
+    validVoidBatch.update(doc(dbOwner, 'organizations', ORG_ALPHA, 'payments', 'pay_flow_1'), {
+      status: 'voided',
+      voidReason: 'إلغاء فاتورة للاختبار',
+      voidedBy: OWNER_A_UID,
+      voidedAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    validVoidBatch.set(
+      doc(dbOwner, 'organizations', ORG_ALPHA, 'ledgerEntries', 'pay_flow_1_rev_charge'),
+      {
+        id: 'pay_flow_1_rev_charge',
+        organizationId: ORG_ALPHA,
+        entryType: 'reversal',
+        direction: 'credit',
+        entityType: 'payment',
+        entityId: 'pay_flow_1',
+        studentId: 'stu_alpha_1',
+        studentName: 'يوسف حسن',
+        groupId: '',
+        amountPiasters: 50000,
+        amount: 500,
+        currency: 'EGP',
+        description: 'عكس الاستحقاق',
+        recordedBy: OWNER_A_UID,
+        createdAt: serverTimestamp(),
+      }
+    );
+    validVoidBatch.set(
+      doc(dbOwner, 'organizations', ORG_ALPHA, 'ledgerEntries', 'pay_flow_1_rev_paid'),
+      {
+        id: 'pay_flow_1_rev_paid',
+        organizationId: ORG_ALPHA,
+        entryType: 'reversal',
+        direction: 'debit',
+        entityType: 'payment',
+        entityId: 'pay_flow_1',
+        studentId: 'stu_alpha_1',
+        studentName: 'يوسف حسن',
+        groupId: '',
+        amountPiasters: 50000,
+        amount: 500,
+        currency: 'EGP',
+        description: 'عكس التحصيل',
+        recordedBy: OWNER_A_UID,
+        createdAt: serverTimestamp(),
+      }
+    );
+    await assertSucceeds(validVoidBatch.commit());
+
+    // 10. Expense charge spoofing studentId fails, while valid atomic expense create + void SUCCEED
+    const spoofedExpenseBatch = writeBatch(dbOwner);
+    spoofedExpenseBatch.set(doc(dbOwner, 'organizations', ORG_ALPHA, 'expenses', 'exp_spoof_1'), {
+      id: 'exp_spoof_1',
+      organizationId: ORG_ALPHA,
+      title: 'مصروف مزور',
+      category: 'other',
+      amount: 100,
+      amountPiasters: 10000,
+      currency: 'EGP',
+      status: 'posted',
+      expenseDate: '2026-11-16',
+      recordedBy: OWNER_A_UID,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    spoofedExpenseBatch.set(
+      doc(dbOwner, 'organizations', ORG_ALPHA, 'ledgerEntries', 'exp_spoof_1_charge'),
+      {
+        id: 'exp_spoof_1_charge',
+        organizationId: ORG_ALPHA,
+        entryType: 'charge',
+        direction: 'debit',
+        entityType: 'expense',
+        entityId: 'exp_spoof_1',
+        studentId: 'stu_alpha_1',
+        amountPiasters: 10000,
+        amount: 100,
+        currency: 'EGP',
+        description: 'حقن studentId داخل قيد مصروف',
+        recordedBy: OWNER_A_UID,
+        createdAt: serverTimestamp(),
+      }
+    );
+    await assertFails(spoofedExpenseBatch.commit());
+
+    const validExpenseCreate = writeBatch(dbOwner);
+    validExpenseCreate.set(doc(dbOwner, 'organizations', ORG_ALPHA, 'expenses', 'exp_flow_1'), {
+      id: 'exp_flow_1',
+      organizationId: ORG_ALPHA,
+      title: 'طباعة ملازم',
+      category: 'printing',
+      amount: 250,
+      amountPiasters: 25000,
+      currency: 'EGP',
+      status: 'posted',
+      expenseDate: '2026-11-16',
+      recordedBy: OWNER_A_UID,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    validExpenseCreate.set(
+      doc(dbOwner, 'organizations', ORG_ALPHA, 'ledgerEntries', 'exp_flow_1_charge'),
+      {
+        id: 'exp_flow_1_charge',
+        organizationId: ORG_ALPHA,
+        entryType: 'charge',
+        direction: 'debit',
+        entityType: 'expense',
+        entityId: 'exp_flow_1',
+        amountPiasters: 25000,
+        amount: 250,
+        currency: 'EGP',
+        description: 'مصروف تشغيلي: طباعة ملازم',
+        recordedBy: OWNER_A_UID,
+        createdAt: serverTimestamp(),
+      }
+    );
+    await assertSucceeds(validExpenseCreate.commit());
+
+    const validExpenseVoid = writeBatch(dbOwner);
+    validExpenseVoid.update(doc(dbOwner, 'organizations', ORG_ALPHA, 'expenses', 'exp_flow_1'), {
+      status: 'voided',
+      voidReason: 'إلغاء مصروف للاختبار',
+      voidedBy: OWNER_A_UID,
+      voidedAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    validExpenseVoid.set(
+      doc(dbOwner, 'organizations', ORG_ALPHA, 'ledgerEntries', 'exp_flow_1_rev_charge'),
+      {
+        id: 'exp_flow_1_rev_charge',
+        organizationId: ORG_ALPHA,
+        entryType: 'reversal',
+        direction: 'credit',
+        entityType: 'expense',
+        entityId: 'exp_flow_1',
+        amountPiasters: 25000,
+        amount: 250,
+        currency: 'EGP',
+        description: 'عكس مصروف تشغيلي',
+        recordedBy: OWNER_A_UID,
+        createdAt: serverTimestamp(),
+      }
+    );
+    await assertSucceeds(validExpenseVoid.commit());
+  });
 });

@@ -217,7 +217,7 @@ export async function createPayment(
       tx.set(paymentRef, paymentPayload);
 
       // Immutable Ledger Entry 1: Charge (Debit receivable)
-      const chargeEntryId = generateId('ldg');
+      const chargeEntryId = `${generatedPaymentId}_charge`;
       tx.set(doc(db, 'organizations', organizationId, 'ledgerEntries', chargeEntryId), {
         id: chargeEntryId,
         organizationId,
@@ -238,7 +238,7 @@ export async function createPayment(
 
       // Immutable Ledger Entry 2: Collected Payment (Credit receivable) if paid > 0
       if (validated.paidAmountPiasters > 0) {
-        const payEntryId = generateId('ldg');
+        const payEntryId = `${generatedPaymentId}_pay_init`;
         tx.set(doc(db, 'organizations', organizationId, 'ledgerEntries', payEntryId), {
           id: payEntryId,
           organizationId,
@@ -339,7 +339,7 @@ export async function settlePaymentInstallment(
 
       tx.update(payRef, settleUpdate);
 
-      const entryId = generateId('ldg');
+      const entryId = `${paymentId}_pay_${settlement.newPaidPiasters}`;
       const installmentEgp = piastersToEgp(settlement.installmentPiasters);
       tx.set(doc(db, 'organizations', organizationId, 'ledgerEntries', entryId), {
         id: entryId,
@@ -390,7 +390,8 @@ export async function createPaymentAdjustment(
   paymentId: string,
   adjustmentAmountEgp: number,
   direction: 'debit' | 'credit',
-  reason: string
+  reason: string,
+  idempotencyKey?: string
 ): Promise<string> {
   if (!isValidEntityId(paymentId)) {
     throw new DomainValidationError('معرّف الدفعة غير صالح.', 'INVALID_PAYMENT_ID');
@@ -399,18 +400,39 @@ export async function createPaymentAdjustment(
   if (cleanReason.length < 3) {
     throw new DomainValidationError('يجب توضيح سبب التسوية المحاسبية.', 'ADJUSTMENT_REASON_REQUIRED');
   }
+  if (
+    idempotencyKey !== undefined &&
+    idempotencyKey !== '' &&
+    (!isValidEntityId(idempotencyKey) || idempotencyKey.length > 100)
+  ) {
+    throw new DomainValidationError('مفتاح منع التكرار (idempotencyKey) غير صالح.', 'INVALID_IDEMPOTENCY_KEY');
+  }
+
+  const effectiveKey = idempotencyKey && idempotencyKey.length > 0 ? idempotencyKey : generateId('adj');
   const amountPiasters = egpToPiasters(adjustmentAmountEgp, {
     allowZero: false,
     fieldLabel: 'قيمة التسوية',
   });
   const amount = piastersToEgp(amountPiasters);
-  const entryId = generateId('ldg');
+  const entryId = `ldg_adj_${effectiveKey}`;
+  const keyDocId = `adj_${effectiveKey}`;
   const path = `organizations/${organizationId}/ledgerEntries/${entryId}`;
 
   try {
-    await runTransaction(db, async (tx) => {
+    return await runTransaction(db, async (tx) => {
       const verifiedMember = await resolveAuthorizedMemberInTx(tx, organizationId, 'payments:adjust');
       await resolveActiveOrganizationInTx(tx, organizationId);
+
+      if (idempotencyKey && idempotencyKey.length > 0) {
+        const keyRef = doc(db, 'organizations', organizationId, 'idempotencyKeys', keyDocId);
+        const keySnap = await tx.get(keyRef);
+        if (keySnap.exists()) {
+          const existingKey = keySnap.data() as { entityId?: string };
+          if (existingKey.entityId) {
+            return existingKey.entityId;
+          }
+        }
+      }
 
       const payRef = doc(db, 'organizations', organizationId, 'payments', paymentId);
       const paySnap = await tx.get(payRef);
@@ -420,6 +442,14 @@ export async function createPaymentAdjustment(
       const payment = paySnap.data() as PaymentRecord;
       if (payment.status === 'voided') {
         throw new DomainValidationError('لا يمكن إضافة تسوية لقيد ملغى.', 'PAYMENT_VOIDED', 409);
+      }
+
+      const paymentTotalPiasters = resolveRecordPiasters(payment.amountPiasters, payment.amount);
+      if (direction === 'credit' && amountPiasters > paymentTotalPiasters) {
+        throw new DomainValidationError(
+          'لا يمكن أن تتجاوز التسوية الدائنة إجمالي قيمة الفاتورة.',
+          'ADJUSTMENT_EXCEEDS_PAYMENT'
+        );
       }
 
       tx.set(doc(db, 'organizations', organizationId, 'ledgerEntries', entryId), {
@@ -435,8 +465,18 @@ export async function createPaymentAdjustment(
         amountPiasters,
         amount,
         currency: 'EGP',
+        idempotencyKey: effectiveKey,
         description: `تسوية محاسبية (${direction}): ${cleanReason}`,
         recordedBy: verifiedMember.uid,
+        createdAt: serverTimestamp(),
+      });
+
+      tx.set(doc(db, 'organizations', organizationId, 'idempotencyKeys', keyDocId), {
+        id: keyDocId,
+        organizationId,
+        entityType: 'ledger_entry',
+        entityId: entryId,
+        createdBy: verifiedMember.uid,
         createdAt: serverTimestamp(),
       });
 
@@ -450,9 +490,9 @@ export async function createPaymentAdjustment(
           after: { paymentId, direction, amountPiasters, reason: cleanReason },
         },
       });
-    });
 
-    return entryId;
+      return entryId;
+    });
   } catch (error) {
     handleFirestoreError(error, OperationType.CREATE, path);
   }
@@ -508,7 +548,7 @@ export async function voidPayment(
       }
       tx.update(payRef, voidPayUpdate);
 
-      const chargeReversalId = generateId('ldg');
+      const chargeReversalId = `${paymentId}_rev_charge`;
       tx.set(doc(db, 'organizations', organizationId, 'ledgerEntries', chargeReversalId), {
         id: chargeReversalId,
         organizationId,
@@ -528,7 +568,7 @@ export async function voidPayment(
       });
 
       if (paidPiasters > 0) {
-        const payReversalId = generateId('ldg');
+        const payReversalId = `${paymentId}_rev_paid`;
         tx.set(doc(db, 'organizations', organizationId, 'ledgerEntries', payReversalId), {
           id: payReversalId,
           organizationId,
@@ -627,7 +667,7 @@ export async function createExpense(
 
       tx.set(doc(db, 'organizations', organizationId, 'expenses', expenseId), payload);
 
-      const entryId = generateId('ldg');
+      const entryId = `${expenseId}_charge`;
       tx.set(doc(db, 'organizations', organizationId, 'ledgerEntries', entryId), {
         id: entryId,
         organizationId,
@@ -724,7 +764,7 @@ export async function voidExpense(
       }
       tx.update(expRef, voidExpUpdate);
 
-      const reversalId = generateId('ldg');
+      const reversalId = `${expenseId}_rev_charge`;
       tx.set(doc(db, 'organizations', organizationId, 'ledgerEntries', reversalId), {
         id: reversalId,
         organizationId,

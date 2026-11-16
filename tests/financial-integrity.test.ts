@@ -389,6 +389,18 @@ describe('TEMA Financial Integrity — Unit & Express API Tests', () => {
       expect(finalSummary.collectedEgp).toBe(0);
       expect(finalSummary.outstandingEgp).toBe(0);
 
+      // Verify deterministic anti-duplication ledger IDs for payment lifecycle
+      const paymentLedgerIds = ledgerEntries.map((e) => e.id).sort();
+      expect(paymentLedgerIds).toEqual(
+        [
+          `${createdJson.paymentId}_charge`,
+          `${createdJson.paymentId}_pay_init`,
+          `${createdJson.paymentId}_pay_50000`,
+          `${createdJson.paymentId}_rev_charge`,
+          `${createdJson.paymentId}_rev_paid`,
+        ].sort()
+      );
+
       // Expense creation allowed for accountant, blocked for assistant
       const assExp = await fetch(`${baseUrl}/api/v1/organizations/org_1/expenses`, {
         method: 'POST',
@@ -413,6 +425,8 @@ describe('TEMA Financial Integrity — Unit & Express API Tests', () => {
         }),
       });
       expect(accExp.status).toBe(201);
+      const expJson = (await accExp.json()) as { expenseId: string };
+      expect(docs.has(`organizations/org_1/ledgerEntries/${expJson.expenseId}_charge`)).toBe(true);
       expect(docs.size).toBeGreaterThan(5);
     });
   });

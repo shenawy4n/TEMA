@@ -18,6 +18,7 @@ import {
   resolveRecordPiasters,
 } from '@/src/lib/domain/money';
 import {
+  validateAdjustmentAgainstPayment,
   validateCreateExpenseInput,
   validateCreatePaymentInput,
   validateSettlementAgainstPayment,
@@ -199,6 +200,8 @@ export async function createPayment(
         amountPiasters: validated.amountPiasters,
         paidAmountPiasters: validated.paidAmountPiasters,
         dueAmountPiasters: validated.dueAmountPiasters,
+        adjustedCreditPiasters: 0,
+        adjustedDebitPiasters: 0,
         currency: 'EGP',
         category: validated.category,
         method: validated.method,
@@ -396,8 +399,8 @@ export async function createPaymentAdjustment(
   if (!isValidEntityId(paymentId)) {
     throw new DomainValidationError('معرّف الدفعة غير صالح.', 'INVALID_PAYMENT_ID');
   }
-  const cleanReason = sanitizeText(reason || '', 200);
-  if (cleanReason.length < 3) {
+  const cleanReasonPrecheck = sanitizeText(reason || '', 200);
+  if (cleanReasonPrecheck.length < 3) {
     throw new DomainValidationError('يجب توضيح سبب التسوية المحاسبية.', 'ADJUSTMENT_REASON_REQUIRED');
   }
   if (
@@ -409,11 +412,10 @@ export async function createPaymentAdjustment(
   }
 
   const effectiveKey = idempotencyKey && idempotencyKey.length > 0 ? idempotencyKey : generateId('adj');
-  const amountPiasters = egpToPiasters(adjustmentAmountEgp, {
+  const amountPiastersPrecheck = egpToPiasters(adjustmentAmountEgp, {
     allowZero: false,
     fieldLabel: 'قيمة التسوية',
   });
-  const amount = piastersToEgp(amountPiasters);
   const entryId = `ldg_adj_${effectiveKey}`;
   const keyDocId = `adj_${effectiveKey}`;
   const path = `organizations/${organizationId}/ledgerEntries/${entryId}`;
@@ -440,17 +442,27 @@ export async function createPaymentAdjustment(
         throw new DomainValidationError('القيد المالي غير موجود.', 'PAYMENT_NOT_FOUND', 404);
       }
       const payment = paySnap.data() as PaymentRecord;
-      if (payment.status === 'voided') {
-        throw new DomainValidationError('لا يمكن إضافة تسوية لقيد ملغى.', 'PAYMENT_VOIDED', 409);
+      const validatedAdj = validateAdjustmentAgainstPayment(
+        payment,
+        adjustmentAmountEgp,
+        direction,
+        cleanReasonPrecheck,
+        effectiveKey
+      );
+
+      const payUpdate: Record<string, unknown> = {
+        adjustedCreditPiasters: validatedAdj.nextAdjustedCredit,
+        adjustedDebitPiasters: validatedAdj.nextAdjustedDebit,
+        lastAdjustmentEntryId: entryId,
+        updatedAt: serverTimestamp(),
+      };
+      if (validatedAdj.needsPiastersBackfill) {
+        payUpdate.amountPiasters = validatedAdj.totalPiasters;
+        payUpdate.paidAmountPiasters = validatedAdj.paidPiasters;
+        payUpdate.dueAmountPiasters = validatedAdj.duePiasters;
       }
 
-      const paymentTotalPiasters = resolveRecordPiasters(payment.amountPiasters, payment.amount);
-      if (direction === 'credit' && amountPiasters > paymentTotalPiasters) {
-        throw new DomainValidationError(
-          'لا يمكن أن تتجاوز التسوية الدائنة إجمالي قيمة الفاتورة.',
-          'ADJUSTMENT_EXCEEDS_PAYMENT'
-        );
-      }
+      tx.update(payRef, payUpdate);
 
       tx.set(doc(db, 'organizations', organizationId, 'ledgerEntries', entryId), {
         id: entryId,
@@ -462,11 +474,11 @@ export async function createPaymentAdjustment(
         studentId: payment.studentId,
         studentName: payment.studentName,
         groupId: payment.groupId || '',
-        amountPiasters,
-        amount,
+        amountPiasters: amountPiastersPrecheck,
+        amount: validatedAdj.amount,
         currency: 'EGP',
         idempotencyKey: effectiveKey,
-        description: `تسوية محاسبية (${direction}): ${cleanReason}`,
+        description: `تسوية محاسبية (${direction}): ${validatedAdj.cleanReason}`,
         recordedBy: verifiedMember.uid,
         createdAt: serverTimestamp(),
       });
@@ -484,10 +496,21 @@ export async function createPaymentAdjustment(
         action: 'payment.adjusted',
         entityType: 'ledger_entry',
         entityId: entryId,
-        summary: `تسوية محاسبية (${direction}) بقيمة ${amount} ج.م على القيد ${paymentId}.`,
+        summary: `تسوية محاسبية (${direction}) بقيمة ${validatedAdj.amount} ج.م على القيد ${paymentId}.`,
         result: 'success',
         metadata: {
-          after: { paymentId, direction, amountPiasters, reason: cleanReason },
+          before: {
+            adjustedCreditPiasters: validatedAdj.prevAdjustedCredit,
+            adjustedDebitPiasters: validatedAdj.prevAdjustedDebit,
+          },
+          after: {
+            paymentId,
+            direction,
+            amountPiasters: validatedAdj.amountPiasters,
+            adjustedCreditPiasters: validatedAdj.nextAdjustedCredit,
+            adjustedDebitPiasters: validatedAdj.nextAdjustedDebit,
+            reason: validatedAdj.cleanReason,
+          },
         },
       });
 

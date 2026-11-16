@@ -12,6 +12,7 @@ import {
 import {
   deriveFinancialSummaryFromLedger,
   deriveStudentLedgerBalance,
+  validateAdjustmentAgainstPayment,
   validateSettlementAgainstPayment,
 } from '../src/lib/domain/ledger';
 import type { LedgerEntry, MemberRole, PaymentRecord } from '../src/types/domain';
@@ -428,6 +429,240 @@ describe('TEMA Financial Integrity — Unit & Express API Tests', () => {
       const expJson = (await accExp.json()) as { expenseId: string };
       expect(docs.has(`organizations/org_1/ledgerEntries/${expJson.expenseId}_charge`)).toBe(true);
       expect(docs.size).toBeGreaterThan(5);
+    });
+  });
+
+  it('5. validateAdjustmentAgainstPayment enforces cumulative credit and debit bounds per payment', () => {
+    const basePayment: PaymentRecord = {
+      id: 'pay_adj_unit_1',
+      organizationId: 'org_1',
+      studentId: 'stu_1',
+      studentName: 'يوسف حسن',
+      amount: 500,
+      paidAmount: 200,
+      dueAmount: 300,
+      amountPiasters: 50000,
+      paidAmountPiasters: 20000,
+      dueAmountPiasters: 30000,
+      adjustedCreditPiasters: 40000,
+      adjustedDebitPiasters: 10000,
+      currency: 'EGP',
+      category: 'tuition',
+      method: 'cash',
+      status: 'partial',
+      recordedBy: 'uid_1',
+      createdAt: null,
+      updatedAt: null,
+    };
+
+    // Within remaining credit allowance (400 + 100 = 500 <= 500) -> SUCCEEDS
+    const validCredit = validateAdjustmentAgainstPayment(
+      basePayment,
+      100,
+      'credit',
+      'خصم متبقي ضمن الحد',
+      'k_credit_1'
+    );
+    expect(validCredit.nextAdjustedCredit).toBe(50000);
+    expect(validCredit.nextAdjustedDebit).toBe(10000);
+
+    // Exceeds cumulative credit limit (400 + 100.01 > 500) -> THROWS
+    expect(() =>
+      validateAdjustmentAgainstPayment(
+        basePayment,
+        100.01,
+        'credit',
+        'محاولة تجاوز إجمالي الفاتورة',
+        'k_credit_2'
+      )
+    ).toThrow(DomainValidationError);
+
+    // Exceeds cumulative debit limit (100 + 401 > 500) -> THROWS
+    expect(() =>
+      validateAdjustmentAgainstPayment(
+        basePayment,
+        401,
+        'debit',
+        'محاولة تجاوز حد التسوية المدينة',
+        'k_debit_over'
+      )
+    ).toThrow(DomainValidationError);
+
+    // Voided payment -> THROWS
+    expect(() =>
+      validateAdjustmentAgainstPayment(
+        { ...basePayment, status: 'voided' },
+        10,
+        'credit',
+        'تسوية على فاتورة ملغاة',
+        'k_voided'
+      )
+    ).toThrow(DomainValidationError);
+  });
+
+  it('6. Express /api/v1 payment adjustment endpoint enforces RBAC, idempotency, and cumulative cap across multiple keys', async () => {
+    const { store, docs } = createInMemoryStore({
+      'organizations/org_1': {
+        id: 'org_1',
+        name: 'أكاديمية النخبة',
+        currency: 'EGP',
+        status: 'active',
+      },
+      'organizations/org_1/students/stu_1': {
+        id: 'stu_1',
+        organizationId: 'org_1',
+        fullName: 'أحمد طارق',
+        status: 'active',
+      },
+    });
+
+    const roleByToken: Record<string, { uid: string; role: MemberRole }> = {
+      tok_assistant: { uid: 'uid_assistant', role: 'assistant' },
+      tok_accountant: { uid: 'uid_accountant', role: 'accountant' },
+    };
+
+    const app = createApiApp({
+      temaApiDeps: {
+        store,
+        verifyToken: async (authHeader) => {
+          const tok = authHeader?.replace('Bearer ', '') ?? '';
+          const entry = roleByToken[tok];
+          if (!entry) return { ok: false, status: 401, error: 'Unauthorized' };
+          return {
+            ok: true,
+            idToken: tok,
+            user: { uid: entry.uid, email: `${entry.role}@tema.edu.eg`, emailVerified: true },
+          };
+        },
+        verifyMembership: async (orgId, uid, idToken) => {
+          const entry = roleByToken[idToken];
+          if (!entry || entry.uid !== uid || orgId !== 'org_1') {
+            return { ok: false, status: 403, error: 'Membership denied' };
+          }
+          return {
+            ok: true,
+            membership: {
+              uid,
+              organizationId: orgId,
+              displayName: entry.role,
+              role: entry.role,
+              status: 'active',
+            },
+          };
+        },
+      },
+    });
+
+    await withServer(app, async (baseUrl) => {
+      // Create 500 EGP payment
+      const createRes = await fetch(`${baseUrl}/api/v1/organizations/org_1/payments`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_assistant' },
+        body: JSON.stringify({
+          studentId: 'stu_1',
+          studentName: 'أحمد طارق',
+          amount: 500,
+          paidAmount: 100,
+          category: 'tuition',
+          method: 'cash',
+        }),
+      });
+      expect(createRes.status).toBe(201);
+      const { paymentId } = (await createRes.json()) as { paymentId: string };
+
+      // Assistant CANNOT adjust payment (owner/accountant only)
+      const assAdj = await fetch(
+        `${baseUrl}/api/v1/organizations/org_1/payments/${paymentId}/adjust`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_assistant' },
+          body: JSON.stringify({
+            adjustmentAmount: 100,
+            direction: 'credit',
+            reason: 'خصم مساعد غير مصرح',
+            idempotencyKey: 'api_adj_ass_1',
+          }),
+        }
+      );
+      expect(assAdj.status).toBe(403);
+
+      // Adjustment 1: 300 EGP credit -> 201
+      const adj1 = await fetch(
+        `${baseUrl}/api/v1/organizations/org_1/payments/${paymentId}/adjust`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_accountant' },
+          body: JSON.stringify({
+            adjustmentAmount: 300,
+            direction: 'credit',
+            reason: 'خصم معتمد دفعة 1',
+            idempotencyKey: 'api_adj_k1',
+          }),
+        }
+      );
+      expect(adj1.status).toBe(201);
+      const adj1Json = (await adj1.json()) as {
+        entryId: string;
+        adjustedCreditPiasters: number;
+      };
+      expect(adj1Json.adjustedCreditPiasters).toBe(30000);
+
+      // Replay Adjustment 1 with same idempotencyKey -> deduplicated 200 without inflating counter
+      const adj1Replay = await fetch(
+        `${baseUrl}/api/v1/organizations/org_1/payments/${paymentId}/adjust`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_accountant' },
+          body: JSON.stringify({
+            adjustmentAmount: 300,
+            direction: 'credit',
+            reason: 'خصم معتمد دفعة 1',
+            idempotencyKey: 'api_adj_k1',
+          }),
+        }
+      );
+      expect(adj1Replay.status).toBe(200);
+      const adj1ReplayJson = (await adj1Replay.json()) as { deduplicated: boolean };
+      expect(adj1ReplayJson.deduplicated).toBe(true);
+
+      // Adjustment 2 with NEW key: 200 EGP credit (cumulative 300 + 200 = 500 == amount) -> 201
+      const adj2 = await fetch(
+        `${baseUrl}/api/v1/organizations/org_1/payments/${paymentId}/adjust`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_accountant' },
+          body: JSON.stringify({
+            adjustmentAmount: 200,
+            direction: 'credit',
+            reason: 'خصم معتمد دفعة 2',
+            idempotencyKey: 'api_adj_k2',
+          }),
+        }
+      );
+      expect(adj2.status).toBe(201);
+
+      // Adjustment 3 with NEW key: 1 EGP credit (cumulative 501 > 500) -> 400 CUMULATIVE_LIMIT_EXCEEDED
+      const adj3 = await fetch(
+        `${baseUrl}/api/v1/organizations/org_1/payments/${paymentId}/adjust`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_accountant' },
+          body: JSON.stringify({
+            adjustmentAmount: 1,
+            direction: 'credit',
+            reason: 'تجاوز الحد المسموح',
+            idempotencyKey: 'api_adj_k3',
+          }),
+        }
+      );
+      expect(adj3.status).toBe(400);
+      const adj3Json = (await adj3.json()) as { code?: string };
+      expect(adj3Json.code).toBe('ADJUSTMENT_EXCEEDS_PAYMENT');
+
+      const storedPayment = docs.get(`organizations/org_1/payments/${paymentId}`) as
+        | { adjustedCreditPiasters?: number }
+        | undefined;
+      expect(storedPayment?.adjustedCreditPiasters).toBe(50000);
     });
   });
 });

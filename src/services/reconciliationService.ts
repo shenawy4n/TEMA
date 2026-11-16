@@ -1,6 +1,7 @@
 import { doc, runTransaction, serverTimestamp } from 'firebase/firestore';
-import { db } from '@/src/lib/firebase/config';
+import { auth, db } from '@/src/lib/firebase/config';
 import { handleFirestoreError, OperationType } from '@/src/lib/firebase/errors';
+import { DomainValidationError } from '@/src/lib/domain/money';
 import {
   computeOrganizationCountReconciliation,
   type OrganizationReconciliationReport,
@@ -33,8 +34,9 @@ export async function inspectOrganizationCountIntegrity(
 }
 
 /**
- * Reconciles organization student counters and every group's studentCount against
- * authoritative Student and GroupEnrollment records inside an atomic transaction.
+ * Reconciles organization student counters inside a client transaction, and delegates
+ * group studentCount drift repair to the trusted server reconciliation endpoint because
+ * direct client-side mutation of groups.studentCount without an enrollment proof is blocked.
  */
 export async function reconcileOrganizationCounts(
   organizationId: string
@@ -47,7 +49,7 @@ export async function reconcileOrganizationCounts(
       listOrganizationEnrollments(organizationId),
     ]);
 
-    return await runTransaction(db, async (tx) => {
+    const initialReport = await runTransaction(db, async (tx) => {
       const verifiedMember = await resolveAuthorizedMemberInTx(
         tx,
         organizationId,
@@ -55,7 +57,7 @@ export async function reconcileOrganizationCounts(
       );
       const org = await resolveActiveOrganizationInTx(tx, organizationId);
 
-      // Re-read org and groups inside transaction for serializability
+      // Re-read org inside transaction for serializability
       const freshOrgSnap = await tx.get(doc(db, 'organizations', organizationId));
       const freshOrg = freshOrgSnap.exists() ? (freshOrgSnap.data() as Organization) : org;
 
@@ -66,7 +68,13 @@ export async function reconcileOrganizationCounts(
         enrollments
       );
 
-      if (report.hasDiscrepancies) {
+      const orgCountsMismatch =
+        report.storedTotalStudents !== report.actualTotalStudents ||
+        report.storedActiveStudents !== report.actualActiveStudents ||
+        report.storedInactiveStudents !== report.actualInactiveStudents ||
+        report.storedArchivedStudents !== report.actualArchivedStudents;
+
+      if (orgCountsMismatch) {
         tx.update(doc(db, 'organizations', organizationId), {
           totalStudentsCount: report.actualTotalStudents,
           activeStudentsCount: report.actualActiveStudents,
@@ -75,24 +83,16 @@ export async function reconcileOrganizationCounts(
           updatedAt: serverTimestamp(),
         });
 
-        for (const diff of report.groupDiscrepancies) {
-          tx.update(doc(db, 'organizations', organizationId, 'groups', diff.groupId), {
-            studentCount: diff.actualEnrolledCount,
-            updatedAt: serverTimestamp(),
-          });
-        }
-
         enqueueAuditLog(tx, organizationId, verifiedMember, {
           action: 'organization.counts_reconciled',
           entityType: 'organization',
           entityId: organizationId,
-          summary: `تمت مطابقة وتصحيح أعداد الطلاب (${report.actualTotalStudents} إجمالي، ${report.groupDiscrepancies.length} مجموعة مصححة).`,
+          summary: `تمت مطابقة وتصحيح أعداد طلاب المنظمة (${report.actualTotalStudents} إجمالي).`,
           result: 'success',
           metadata: {
             before: {
               totalStudentsCount: report.storedTotalStudents,
               activeStudentsCount: report.storedActiveStudents,
-              groupDiscrepancies: report.groupDiscrepancies.length,
             },
             after: {
               totalStudentsCount: report.actualTotalStudents,
@@ -105,6 +105,38 @@ export async function reconcileOrganizationCounts(
 
       return report;
     });
+
+    if (initialReport.groupDiscrepancies.length > 0) {
+      const idToken = await auth.currentUser?.getIdToken();
+      if (!idToken) {
+        throw new DomainValidationError(
+          'تعذر إتمام مطابقة عدادات المجموعات: الجلسة غير مصرح بها.',
+          'UNAUTHENTICATED',
+          401
+        );
+      }
+
+      const res = await fetch(`/api/v1/organizations/${encodeURIComponent(organizationId)}/reconcile`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${idToken}`,
+        },
+      });
+      if (!res.ok) {
+        throw new DomainValidationError(
+          'إصلاح فروقات عداد المجموعات يتطلب مسار الخادم الموثوق ولا يُسمح بتعديله مباشرة من العميل.',
+          'SERVER_RECONCILE_REQUIRED',
+          res.status
+        );
+      }
+      const data = (await res.json()) as { report?: OrganizationReconciliationReport };
+      if (data.report) {
+        return data.report;
+      }
+    }
+
+    return initialReport;
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, path);
   }

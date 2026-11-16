@@ -18,7 +18,11 @@ import {
   resolveRecordPiasters,
 } from '../../src/lib/domain/money';
 import { assertPermission, sanitizeAuditMetadata, type TemaPermission } from '../../src/lib/domain/rbac';
+import { getApps, initializeApp } from 'firebase-admin/app';
+import { FieldValue, getFirestore as getAdminFirestore } from 'firebase-admin/firestore';
+import firebaseConfig from '../../firebase-applet-config.json' with { type: 'json' };
 import {
+  validateAdjustmentAgainstPayment,
   validateCreateExpenseInput,
   validateCreatePaymentInput,
   validateSettlementAgainstPayment,
@@ -71,6 +75,37 @@ function makeServerId(prefix: string): string {
 
 function todayIso(): string {
   return new Date().toISOString().slice(0, 10);
+}
+
+async function adminCommitWrites(writes: RestWriteInstruction[]): Promise<void> {
+  const app =
+    getApps().length > 0
+      ? getApps()[0]
+      : initializeApp({ projectId: firebaseConfig.projectId });
+  const adminDb = getAdminFirestore(app, firebaseConfig.firestoreDatabaseId || '(default)');
+  const batch = adminDb.batch();
+
+  const mapAdminPayload = (data: Record<string, unknown>) => {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(data)) {
+      if (v === undefined) continue;
+      out[k] = v === SERVER_TIMESTAMP_SENTINEL ? FieldValue.serverTimestamp() : v;
+    }
+    return out;
+  };
+
+  for (const w of writes) {
+    const cleanPath = w.path.replace(/^\/+/, '');
+    const docRef = adminDb.doc(cleanPath);
+    const payload = mapAdminPayload(w.data);
+    if (w.type === 'set') {
+      batch.set(docRef, payload);
+    } else {
+      batch.update(docRef, payload);
+    }
+  }
+
+  await batch.commit();
 }
 
 function buildAuditWrite(
@@ -276,6 +311,8 @@ export function createTemaApiRouter(deps: TemaApiDeps): Router {
             amountPiasters: validated.amountPiasters,
             paidAmountPiasters: validated.paidAmountPiasters,
             dueAmountPiasters: validated.dueAmountPiasters,
+            adjustedCreditPiasters: 0,
+            adjustedDebitPiasters: 0,
             currency: 'EGP',
             category: validated.category,
             method: validated.method,
@@ -474,6 +511,152 @@ export function createTemaApiRouter(deps: TemaApiDeps): Router {
           status: settlement.nextStatus,
           paidAmount: settlement.newPaidAmount,
           dueAmount: settlement.newDueAmount,
+          correlationId: ctx.correlationId,
+        });
+      } catch (err) {
+        sendErrorResponse(res, err, ctx.correlationId);
+      }
+    }
+  );
+
+  // POST /api/v1/organizations/:orgId/payments/:paymentId/adjust
+  router.post(
+    '/organizations/:orgId/payments/:paymentId/adjust',
+    async (req: Request, res: Response) => {
+      const ctx = await authorizeRequest(req, res, deps, 'payments:adjust');
+      if (!ctx) return;
+
+      try {
+        const paymentId = req.params.paymentId;
+        if (!paymentId || !isValidEntityId(paymentId)) {
+          throw new DomainValidationError('معرّف الدفعة غير صالح.', 'INVALID_PAYMENT_ID');
+        }
+
+        const body = (req.body ?? {}) as Record<string, unknown>;
+        const direction = body.direction as 'debit' | 'credit';
+        const rawKey = typeof body.idempotencyKey === 'string' ? body.idempotencyKey.trim() : '';
+        const effectiveKey = rawKey.length > 0 ? rawKey : makeServerId('adj');
+        const keyDocId = `adj_${effectiveKey}`;
+
+        if (rawKey.length > 0) {
+          const existingKey = await deps.store.getDoc<{ entityId?: string }>(
+            `organizations/${ctx.orgId}/idempotencyKeys/${keyDocId}`,
+            ctx.idToken
+          );
+          if (existingKey?.entityId) {
+            res.status(200).json({
+              entryId: existingKey.entityId,
+              deduplicated: true,
+              correlationId: ctx.correlationId,
+            });
+            return;
+          }
+        }
+
+        const existing = await deps.store.getDoc<PaymentRecord>(
+          `organizations/${ctx.orgId}/payments/${paymentId}`,
+          ctx.idToken
+        );
+        if (!existing || existing.organizationId !== ctx.orgId) {
+          throw new DomainValidationError('القيد المالي غير موجود.', 'PAYMENT_NOT_FOUND', 404);
+        }
+
+        const validatedAdj = validateAdjustmentAgainstPayment(
+          existing,
+          body.adjustmentAmount as number,
+          direction,
+          typeof body.reason === 'string' ? body.reason : '',
+          effectiveKey
+        );
+
+        const entryId = `ldg_adj_${effectiveKey}`;
+        const payUpdateData: Record<string, unknown> = {
+          adjustedCreditPiasters: validatedAdj.nextAdjustedCredit,
+          adjustedDebitPiasters: validatedAdj.nextAdjustedDebit,
+          lastAdjustmentEntryId: entryId,
+          updatedAt: SERVER_TIMESTAMP_SENTINEL,
+          ...(validatedAdj.needsPiastersBackfill
+            ? {
+                amountPiasters: validatedAdj.totalPiasters,
+                paidAmountPiasters: validatedAdj.paidPiasters,
+                dueAmountPiasters: validatedAdj.duePiasters,
+              }
+            : {}),
+        };
+
+        await deps.store.commitWrites(
+          [
+            {
+              type: 'update',
+              path: `organizations/${ctx.orgId}/payments/${paymentId}`,
+              data: payUpdateData,
+            },
+            {
+              type: 'set',
+              path: `organizations/${ctx.orgId}/ledgerEntries/${entryId}`,
+              data: {
+                id: entryId,
+                organizationId: ctx.orgId,
+                entryType: 'adjustment',
+                direction,
+                entityType: 'payment',
+                entityId: paymentId,
+                studentId: existing.studentId,
+                studentName: existing.studentName,
+                groupId: existing.groupId || '',
+                amountPiasters: validatedAdj.amountPiasters,
+                amount: validatedAdj.amount,
+                currency: 'EGP',
+                idempotencyKey: effectiveKey,
+                description: `تسوية محاسبية (${direction}): ${validatedAdj.cleanReason}`,
+                recordedBy: ctx.member.uid,
+                createdAt: SERVER_TIMESTAMP_SENTINEL,
+              },
+            },
+            {
+              type: 'set',
+              path: `organizations/${ctx.orgId}/idempotencyKeys/${keyDocId}`,
+              data: {
+                id: keyDocId,
+                organizationId: ctx.orgId,
+                entityType: 'ledger_entry',
+                entityId: entryId,
+                createdBy: ctx.member.uid,
+                createdAt: SERVER_TIMESTAMP_SENTINEL,
+              },
+            },
+            buildAuditWrite(ctx.orgId, ctx.member, {
+              action: 'payment.adjusted',
+              entityType: 'ledger_entry',
+              entityId: entryId,
+              summary: `تسوية محاسبية (${direction}) بقيمة ${validatedAdj.amount} ج.م على القيد ${paymentId}.`,
+              result: 'success',
+              correlationId: ctx.correlationId,
+              metadata: {
+                before: {
+                  adjustedCreditPiasters: validatedAdj.prevAdjustedCredit,
+                  adjustedDebitPiasters: validatedAdj.prevAdjustedDebit,
+                },
+                after: {
+                  paymentId,
+                  direction,
+                  amountPiasters: validatedAdj.amountPiasters,
+                  adjustedCreditPiasters: validatedAdj.nextAdjustedCredit,
+                  adjustedDebitPiasters: validatedAdj.nextAdjustedDebit,
+                },
+              },
+            }),
+          ],
+          ctx.idToken
+        );
+
+        res.status(201).json({
+          entryId,
+          paymentId,
+          direction,
+          amountPiasters: validatedAdj.amountPiasters,
+          adjustedCreditPiasters: validatedAdj.nextAdjustedCredit,
+          adjustedDebitPiasters: validatedAdj.nextAdjustedDebit,
           correlationId: ctx.correlationId,
         });
       } catch (err) {
@@ -827,7 +1010,11 @@ export function createTemaApiRouter(deps: TemaApiDeps): Router {
             },
           }),
         ];
-        await deps.store.commitWrites(writes, ctx.idToken);
+        if (deps.store === firestoreRestDataStore && report.groupDiscrepancies.length > 0) {
+          await adminCommitWrites(writes);
+        } else {
+          await deps.store.commitWrites(writes, ctx.idToken);
+        }
       }
 
       res.status(200).json({ report, correlationId: ctx.correlationId });

@@ -296,6 +296,7 @@ service cloud.firestore {
           'id', 'organizationId', 'studentId', 'studentName', 'groupId',
           'amount', 'paidAmount', 'dueAmount',
           'amountPiasters', 'paidAmountPiasters', 'dueAmountPiasters',
+          'adjustedCreditPiasters', 'adjustedDebitPiasters', 'lastAdjustmentEntryId',
           'currency', 'category', 'method', 'status', 'paymentDate',
           'referenceNumber', 'idempotencyKey', 'notes',
           'voidReason', 'voidedBy', 'voidedAt',
@@ -315,6 +316,9 @@ service cloud.firestore {
         && isNonNegInt(data.dueAmountPiasters)
         && data.paidAmountPiasters <= data.amountPiasters
         && (data.paidAmountPiasters + data.dueAmountPiasters) == data.amountPiasters
+        && (!('adjustedCreditPiasters' in data) || (isNonNegInt(data.adjustedCreditPiasters) && data.adjustedCreditPiasters <= data.amountPiasters))
+        && (!('adjustedDebitPiasters' in data) || (isNonNegInt(data.adjustedDebitPiasters) && data.adjustedDebitPiasters <= data.amountPiasters))
+        && (!('lastAdjustmentEntryId' in data) || isValidId(data.lastAdjustmentEntryId))
         && data.currency == 'EGP'
         && data.category in ['tuition', 'materials', 'registration', 'other']
         && data.method in ['cash', 'vodafone_cash', 'instapay', 'bank_transfer', 'card']
@@ -420,6 +424,26 @@ service cloud.firestore {
       return getAfter(/databases/$(database)/documents/organizations/$(orgId)/payments/$(paymentId)).data;
     }
 
+    function hasLedgerDoc(orgId, entryId) {
+      return exists(/databases/$(database)/documents/organizations/$(orgId)/ledgerEntries/$(entryId));
+    }
+
+    function hasLedgerDocAfter(orgId, entryId) {
+      return existsAfter(/databases/$(database)/documents/organizations/$(orgId)/ledgerEntries/$(entryId));
+    }
+
+    function getLedgerAfter(orgId, entryId) {
+      return getAfter(/databases/$(database)/documents/organizations/$(orgId)/ledgerEntries/$(entryId)).data;
+    }
+
+    function getPaymentAdjustedCreditBefore(payData) {
+      return 'adjustedCreditPiasters' in payData ? payData.adjustedCreditPiasters : 0;
+    }
+
+    function getPaymentAdjustedDebitBefore(payData) {
+      return 'adjustedDebitPiasters' in payData ? payData.adjustedDebitPiasters : 0;
+    }
+
     function hasExpenseDoc(orgId, expenseId) {
       return exists(/databases/$(database)/documents/organizations/$(orgId)/expenses/$(expenseId));
     }
@@ -441,6 +465,109 @@ service cloud.firestore {
         ((!('groupId' in payData) || payData.groupId == '') && (!('groupId' in entryData) || entryData.groupId == ''))
         || ('groupId' in payData && 'groupId' in entryData && payData.groupId == entryData.groupId)
       );
+    }
+
+    function hasGroupDoc(orgId, groupId) {
+      return exists(/databases/$(database)/documents/organizations/$(orgId)/groups/$(groupId));
+    }
+
+    function getGroupBefore(orgId, groupId) {
+      return get(/databases/$(database)/documents/organizations/$(orgId)/groups/$(groupId)).data;
+    }
+
+    function getGroupAfter(orgId, groupId) {
+      return getAfter(/databases/$(database)/documents/organizations/$(orgId)/groups/$(groupId)).data;
+    }
+
+    function hasStudentDoc(orgId, studentId) {
+      return exists(/databases/$(database)/documents/organizations/$(orgId)/students/$(studentId));
+    }
+
+    function getStudentBefore(orgId, studentId) {
+      return get(/databases/$(database)/documents/organizations/$(orgId)/students/$(studentId)).data;
+    }
+
+    function hasEnrollmentDoc(orgId, enrollmentId) {
+      return exists(/databases/$(database)/documents/organizations/$(orgId)/enrollments/$(enrollmentId));
+    }
+
+    function hasEnrollmentDocAfter(orgId, enrollmentId) {
+      return existsAfter(/databases/$(database)/documents/organizations/$(orgId)/enrollments/$(enrollmentId));
+    }
+
+    function getEnrollmentBefore(orgId, enrollmentId) {
+      return get(/databases/$(database)/documents/organizations/$(orgId)/enrollments/$(enrollmentId)).data;
+    }
+
+    function getEnrollmentAfter(orgId, enrollmentId) {
+      return getAfter(/databases/$(database)/documents/organizations/$(orgId)/enrollments/$(enrollmentId)).data;
+    }
+
+    function isValidGroupEnrollmentIncrement(orgId, groupId) {
+      return hasAnyRole(orgId, ['owner', 'teacher', 'assistant'])
+        && existing().status == 'active'
+        && 'lastEnrollmentId' in incoming()
+        && isValidId(incoming().lastEnrollmentId)
+        && incoming().diff(existing()).affectedKeys().hasOnly(['studentCount', 'lastEnrollmentId', 'updatedAt'])
+        && incoming().studentCount == existing().studentCount + 1
+        && hasEnrollmentDocAfter(orgId, incoming().lastEnrollmentId)
+        && (!hasEnrollmentDoc(orgId, incoming().lastEnrollmentId)
+            || getEnrollmentBefore(orgId, incoming().lastEnrollmentId).status == 'removed')
+        && getEnrollmentAfter(orgId, incoming().lastEnrollmentId).organizationId == orgId
+        && getEnrollmentAfter(orgId, incoming().lastEnrollmentId).groupId == groupId
+        && isValidId(getEnrollmentAfter(orgId, incoming().lastEnrollmentId).studentId)
+        && getEnrollmentAfter(orgId, incoming().lastEnrollmentId).id == (groupId + '_' + getEnrollmentAfter(orgId, incoming().lastEnrollmentId).studentId)
+        && incoming().lastEnrollmentId == (groupId + '_' + getEnrollmentAfter(orgId, incoming().lastEnrollmentId).studentId)
+        && getEnrollmentAfter(orgId, incoming().lastEnrollmentId).status == 'active'
+        && getEnrollmentAfter(orgId, incoming().lastEnrollmentId).enrolledAt == request.time
+        && getEnrollmentAfter(orgId, incoming().lastEnrollmentId).updatedAt == request.time
+        && hasStudentDoc(orgId, getEnrollmentAfter(orgId, incoming().lastEnrollmentId).studentId)
+        && getStudentBefore(orgId, getEnrollmentAfter(orgId, incoming().lastEnrollmentId).studentId).organizationId == orgId
+        && getStudentBefore(orgId, getEnrollmentAfter(orgId, incoming().lastEnrollmentId).studentId).status == 'active';
+    }
+
+    function isValidGroupEnrollmentDecrement(orgId, groupId) {
+      return hasAnyRole(orgId, ['owner', 'teacher', 'assistant'])
+        && existing().studentCount > 0
+        && 'lastEnrollmentId' in incoming()
+        && isValidId(incoming().lastEnrollmentId)
+        && incoming().diff(existing()).affectedKeys().hasOnly(['studentCount', 'lastEnrollmentId', 'updatedAt'])
+        && incoming().studentCount == existing().studentCount - 1
+        && hasEnrollmentDoc(orgId, incoming().lastEnrollmentId)
+        && hasEnrollmentDocAfter(orgId, incoming().lastEnrollmentId)
+        && getEnrollmentBefore(orgId, incoming().lastEnrollmentId).organizationId == orgId
+        && getEnrollmentBefore(orgId, incoming().lastEnrollmentId).groupId == groupId
+        && isValidId(getEnrollmentBefore(orgId, incoming().lastEnrollmentId).studentId)
+        && incoming().lastEnrollmentId == (groupId + '_' + getEnrollmentBefore(orgId, incoming().lastEnrollmentId).studentId)
+        && getEnrollmentBefore(orgId, incoming().lastEnrollmentId).status == 'active'
+        && getEnrollmentAfter(orgId, incoming().lastEnrollmentId).organizationId == orgId
+        && getEnrollmentAfter(orgId, incoming().lastEnrollmentId).groupId == groupId
+        && getEnrollmentAfter(orgId, incoming().lastEnrollmentId).studentId == getEnrollmentBefore(orgId, incoming().lastEnrollmentId).studentId
+        && getEnrollmentAfter(orgId, incoming().lastEnrollmentId).status == 'removed'
+        && getEnrollmentAfter(orgId, incoming().lastEnrollmentId).removedAt == request.time
+        && getEnrollmentAfter(orgId, incoming().lastEnrollmentId).updatedAt == request.time;
+    }
+
+    function isValidEnrollmentGroupLinkOnActivate(orgId, enrollmentId) {
+      return hasGroupDoc(orgId, incoming().groupId)
+        && getGroupBefore(orgId, incoming().groupId).organizationId == orgId
+        && getGroupBefore(orgId, incoming().groupId).status == 'active'
+        && getGroupBefore(orgId, incoming().groupId).studentCount < getGroupBefore(orgId, incoming().groupId).capacity
+        && hasStudentDoc(orgId, incoming().studentId)
+        && getStudentBefore(orgId, incoming().studentId).organizationId == orgId
+        && getStudentBefore(orgId, incoming().studentId).status == 'active'
+        && getGroupAfter(orgId, incoming().groupId).studentCount == getGroupBefore(orgId, incoming().groupId).studentCount + 1
+        && getGroupAfter(orgId, incoming().groupId).lastEnrollmentId == enrollmentId
+        && getGroupAfter(orgId, incoming().groupId).updatedAt == request.time;
+    }
+
+    function isValidEnrollmentGroupLinkOnRemove(orgId, enrollmentId) {
+      return hasGroupDoc(orgId, incoming().groupId)
+        && getGroupBefore(orgId, incoming().groupId).organizationId == orgId
+        && getGroupBefore(orgId, incoming().groupId).studentCount > 0
+        && getGroupAfter(orgId, incoming().groupId).studentCount == getGroupBefore(orgId, incoming().groupId).studentCount - 1
+        && getGroupAfter(orgId, incoming().groupId).lastEnrollmentId == enrollmentId
+        && getGroupAfter(orgId, incoming().groupId).updatedAt == request.time;
     }
 
     function isValidPaymentCreateChargeLedger(orgId, entryId) {
@@ -539,6 +666,31 @@ service cloud.firestore {
         );
     }
 
+    function isValidPaymentAdjustmentCounterUpdate(orgId, paymentId) {
+      return !hasLedgerDoc(orgId, incoming().lastAdjustmentEntryId)
+        && hasLedgerDocAfter(orgId, incoming().lastAdjustmentEntryId)
+        && getLedgerAfter(orgId, incoming().lastAdjustmentEntryId).organizationId == orgId
+        && getLedgerAfter(orgId, incoming().lastAdjustmentEntryId).entityType == 'payment'
+        && getLedgerAfter(orgId, incoming().lastAdjustmentEntryId).entityId == paymentId
+        && getLedgerAfter(orgId, incoming().lastAdjustmentEntryId).entryType == 'adjustment'
+        && getLedgerAfter(orgId, incoming().lastAdjustmentEntryId).createdAt == request.time
+        && (
+          (
+            getLedgerAfter(orgId, incoming().lastAdjustmentEntryId).direction == 'credit'
+            && incoming().adjustedCreditPiasters == (getPaymentAdjustedCreditBefore(existing()) + getLedgerAfter(orgId, incoming().lastAdjustmentEntryId).amountPiasters)
+            && incoming().adjustedDebitPiasters == getPaymentAdjustedDebitBefore(existing())
+            && incoming().adjustedCreditPiasters <= incoming().amountPiasters
+          )
+          ||
+          (
+            getLedgerAfter(orgId, incoming().lastAdjustmentEntryId).direction == 'debit'
+            && incoming().adjustedDebitPiasters == (getPaymentAdjustedDebitBefore(existing()) + getLedgerAfter(orgId, incoming().lastAdjustmentEntryId).amountPiasters)
+            && incoming().adjustedCreditPiasters == getPaymentAdjustedCreditBefore(existing())
+            && incoming().adjustedDebitPiasters <= incoming().amountPiasters
+          )
+        );
+    }
+
     function isValidPaymentAdjustmentLedger(orgId, entryId) {
       return hasAnyRole(orgId, ['owner', 'accountant'])
         && incoming().entityType == 'payment'
@@ -552,19 +704,28 @@ service cloud.firestore {
         && getAfter(/databases/$(database)/documents/organizations/$(orgId)/idempotencyKeys/$(('adj_' + incoming().idempotencyKey))).data.entityType == 'ledger_entry'
         && getAfter(/databases/$(database)/documents/organizations/$(orgId)/idempotencyKeys/$(('adj_' + incoming().idempotencyKey))).data.entityId == entryId
         && hasPaymentDoc(orgId, incoming().entityId)
+        && hasPaymentDocAfter(orgId, incoming().entityId)
         && getPaymentBefore(orgId, incoming().entityId).organizationId == orgId
+        && getPaymentAfter(orgId, incoming().entityId).organizationId == orgId
         && getPaymentBefore(orgId, incoming().entityId).status != 'voided'
-        && incoming().studentId == getPaymentBefore(orgId, incoming().entityId).studentId
-        && matchesPaymentGroupId(getPaymentBefore(orgId, incoming().entityId), incoming())
+        && getPaymentAfter(orgId, incoming().entityId).status == getPaymentBefore(orgId, incoming().entityId).status
+        && getPaymentAfter(orgId, incoming().entityId).updatedAt == request.time
+        && getPaymentAfter(orgId, incoming().entityId).lastAdjustmentEntryId == entryId
+        && incoming().studentId == getPaymentAfter(orgId, incoming().entityId).studentId
+        && matchesPaymentGroupId(getPaymentAfter(orgId, incoming().entityId), incoming())
         && (
-          incoming().direction == 'debit'
-          || (
-            'amountPiasters' in getPaymentBefore(orgId, incoming().entityId)
-            && incoming().amountPiasters <= getPaymentBefore(orgId, incoming().entityId).amountPiasters
+          (
+            incoming().direction == 'credit'
+            && getPaymentAfter(orgId, incoming().entityId).adjustedCreditPiasters == (getPaymentAdjustedCreditBefore(getPaymentBefore(orgId, incoming().entityId)) + incoming().amountPiasters)
+            && getPaymentAfter(orgId, incoming().entityId).adjustedCreditPiasters <= getPaymentAfter(orgId, incoming().entityId).amountPiasters
+            && getPaymentAfter(orgId, incoming().entityId).adjustedDebitPiasters == getPaymentAdjustedDebitBefore(getPaymentBefore(orgId, incoming().entityId))
           )
-          || (
-            !('amountPiasters' in getPaymentBefore(orgId, incoming().entityId))
-            && incoming().amount <= getPaymentBefore(orgId, incoming().entityId).amount
+          ||
+          (
+            incoming().direction == 'debit'
+            && getPaymentAfter(orgId, incoming().entityId).adjustedDebitPiasters == (getPaymentAdjustedDebitBefore(getPaymentBefore(orgId, incoming().entityId)) + incoming().amountPiasters)
+            && getPaymentAfter(orgId, incoming().entityId).adjustedDebitPiasters <= getPaymentAfter(orgId, incoming().entityId).amountPiasters
+            && getPaymentAfter(orgId, incoming().entityId).adjustedCreditPiasters == getPaymentAdjustedCreditBefore(getPaymentBefore(orgId, incoming().entityId))
           )
         );
     }
@@ -812,6 +973,7 @@ service cloud.firestore {
           && hasAnyRole(organizationId, ['owner', 'teacher', 'assistant'])
           && isValidGroup(incoming(), organizationId, groupId)
           && incoming().studentCount == 0
+          && !('lastEnrollmentId' in incoming())
           && exists(/databases/$(database)/documents/organizations/$(organizationId)/members/$(incoming().teacherId))
           && get(/databases/$(database)/documents/organizations/$(organizationId)/members/$(incoming().teacherId)).data.status == 'active'
           && get(/databases/$(database)/documents/organizations/$(organizationId)/members/$(incoming().teacherId)).data.role in ['owner', 'teacher']
@@ -836,38 +998,15 @@ service cloud.firestore {
                 'scheduleSummary', 'monthlyFee', 'status', 'updatedAt'
               ])
             )
-            ||
-            (
-              hasAnyRole(organizationId, ['owner', 'teacher', 'assistant'])
-              && 'lastEnrollmentId' in incoming()
-              && incoming().diff(existing()).affectedKeys().hasOnly(['studentCount', 'lastEnrollmentId', 'updatedAt'])
-              && (
-                (
-                  incoming().studentCount == existing().studentCount + 1
-                  && getAfter(/databases/$(database)/documents/organizations/$(organizationId)/enrollments/$(incoming().lastEnrollmentId)).data.groupId == groupId
-                  && getAfter(/databases/$(database)/documents/organizations/$(organizationId)/enrollments/$(incoming().lastEnrollmentId)).data.status == 'active'
-                )
-                ||
-                (
-                  incoming().studentCount == existing().studentCount - 1
-                  && get(/databases/$(database)/documents/organizations/$(organizationId)/enrollments/$(incoming().lastEnrollmentId)).data.groupId == groupId
-                  && get(/databases/$(database)/documents/organizations/$(organizationId)/enrollments/$(incoming().lastEnrollmentId)).data.status == 'active'
-                  && getAfter(/databases/$(database)/documents/organizations/$(organizationId)/enrollments/$(incoming().lastEnrollmentId)).data.status == 'removed'
-                )
-              )
-            )
-            ||
-            (
-              hasAnyRole(organizationId, ['owner', 'accountant'])
-              && incoming().diff(existing()).affectedKeys().hasOnly(['studentCount', 'updatedAt'])
-            )
+            || isValidGroupEnrollmentIncrement(organizationId, groupId)
+            || isValidGroupEnrollmentDecrement(organizationId, groupId)
           );
 
         allow delete: if isValidId(organizationId) && isValidId(groupId) && isOrgOwner(organizationId);
       }
 
       // -----------------------------------------------------------------------
-      // Group Enrollments (Deterministic {groupId}_{studentId})
+      // Group Enrollments (Deterministic {groupId}_{studentId}, atomically coupled to groups.studentCount)
       // -----------------------------------------------------------------------
       match /enrollments/{enrollmentId} {
         allow get: if isValidId(organizationId) && isValidId(enrollmentId) && isActiveMember(organizationId);
@@ -879,11 +1018,10 @@ service cloud.firestore {
           && isValidEnrollment(incoming(), organizationId, enrollmentId)
           && incoming().status == 'active'
           && incoming().enrolledBy == request.auth.uid
-          && get(/databases/$(database)/documents/organizations/$(organizationId)/groups/$(incoming().groupId)).data.status == 'active'
-          && get(/databases/$(database)/documents/organizations/$(organizationId)/students/$(incoming().studentId)).data.status == 'active'
           && incoming().enrolledAt == request.time
           && incoming().createdAt == request.time
-          && incoming().updatedAt == request.time;
+          && incoming().updatedAt == request.time
+          && isValidEnrollmentGroupLinkOnActivate(organizationId, enrollmentId);
 
         allow update: if isValidId(organizationId)
           && isValidId(enrollmentId)
@@ -902,6 +1040,7 @@ service cloud.firestore {
               && incoming().removedBy == request.auth.uid
               && incoming().removedAt == request.time
               && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'removedBy', 'removedAt', 'updatedAt'])
+              && isValidEnrollmentGroupLinkOnRemove(organizationId, enrollmentId)
             )
             ||
             (
@@ -909,9 +1048,8 @@ service cloud.firestore {
               && incoming().status == 'active'
               && incoming().enrolledBy == request.auth.uid
               && incoming().enrolledAt == request.time
-              && get(/databases/$(database)/documents/organizations/$(organizationId)/groups/$(incoming().groupId)).data.status == 'active'
-              && get(/databases/$(database)/documents/organizations/$(organizationId)/students/$(incoming().studentId)).data.status == 'active'
               && incoming().diff(existing()).affectedKeys().hasOnly(['studentName', 'groupName', 'status', 'enrolledBy', 'enrolledAt', 'updatedAt'])
+              && isValidEnrollmentGroupLinkOnActivate(organizationId, enrollmentId)
             )
           );
 
@@ -1006,6 +1144,9 @@ service cloud.firestore {
           && hasAnyRole(organizationId, ['owner', 'accountant', 'assistant'])
           && isValidPayment(incoming(), organizationId, paymentId)
           && incoming().status != 'voided'
+          && (!('adjustedCreditPiasters' in incoming()) || incoming().adjustedCreditPiasters == 0)
+          && (!('adjustedDebitPiasters' in incoming()) || incoming().adjustedDebitPiasters == 0)
+          && !('lastAdjustmentEntryId' in incoming())
           && exists(/databases/$(database)/documents/organizations/$(organizationId)/students/$(incoming().studentId))
           && incoming().recordedBy == request.auth.uid
           && incoming().createdAt == request.time
@@ -1019,7 +1160,10 @@ service cloud.firestore {
           && incoming().organizationId == existing().organizationId
           && incoming().studentId == existing().studentId
           && incoming().amount == existing().amount
-          && (!('amountPiasters' in existing()) || incoming().amountPiasters == existing().amountPiasters)
+          && (
+            ('amountPiasters' in existing() && incoming().amountPiasters == existing().amountPiasters)
+            || (!('amountPiasters' in existing()) && math.abs((existing().amount * 100) - incoming().amountPiasters) < 0.5)
+          )
           && incoming().currency == existing().currency
           && incoming().category == existing().category
           && incoming().createdAt == existing().createdAt
@@ -1050,6 +1194,24 @@ service cloud.firestore {
                 'amountPiasters', 'paidAmountPiasters', 'dueAmountPiasters',
                 'status', 'voidReason', 'voidedBy', 'voidedAt', 'updatedAt'
               ])
+            )
+            ||
+            (
+              hasAnyRole(organizationId, ['owner', 'accountant'])
+              && incoming().status == existing().status
+              && incoming().paidAmount == existing().paidAmount
+              && incoming().dueAmount == existing().dueAmount
+              && (!('paidAmountPiasters' in existing()) || incoming().paidAmountPiasters == existing().paidAmountPiasters)
+              && (!('dueAmountPiasters' in existing()) || incoming().dueAmountPiasters == existing().dueAmountPiasters)
+              && 'adjustedCreditPiasters' in incoming()
+              && 'adjustedDebitPiasters' in incoming()
+              && 'lastAdjustmentEntryId' in incoming()
+              && isValidId(incoming().lastAdjustmentEntryId)
+              && incoming().diff(existing()).affectedKeys().hasOnly([
+                'amountPiasters', 'paidAmountPiasters', 'dueAmountPiasters',
+                'adjustedCreditPiasters', 'adjustedDebitPiasters', 'lastAdjustmentEntryId', 'updatedAt'
+              ])
+              && isValidPaymentAdjustmentCounterUpdate(organizationId, paymentId)
             )
           );
 

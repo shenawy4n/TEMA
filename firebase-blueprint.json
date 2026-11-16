@@ -638,6 +638,17 @@
         "dueAmountPiasters": {
           "type": "integer"
         },
+        "adjustedCreditPiasters": {
+          "type": "integer"
+        },
+        "adjustedDebitPiasters": {
+          "type": "integer"
+        },
+        "lastAdjustmentEntryId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
         "currency": {
           "type": "string",
           "enum": ["EGP"]

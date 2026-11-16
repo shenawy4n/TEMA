@@ -958,8 +958,60 @@ describe('TEMA Firestore Security Rules — Emulator Isolation & RBAC Verificati
     });
     await assertFails(assistantAdjBatch.commit());
 
-    // 7. Owner valid adjustment WITH idempotencyKeys lock SUCCEEDS, duplicate replay FAILS, and over-credit FAILS
+    // 7. Owner valid adjustment WITHOUT atomic payments counter update FAILS,
+    //    and spoofing payments counter without ledgerEntry FAILS
+    const adjWithoutPaymentUpdate = writeBatch(dbOwner);
+    adjWithoutPaymentUpdate.set(
+      doc(dbOwner, 'organizations', ORG_ALPHA, 'ledgerEntries', 'ldg_adj_no_pay'),
+      {
+        id: 'ldg_adj_no_pay',
+        organizationId: ORG_ALPHA,
+        entryType: 'adjustment',
+        direction: 'credit',
+        entityType: 'payment',
+        entityId: 'pay_flow_1',
+        studentId: 'stu_alpha_1',
+        groupId: '',
+        amountPiasters: 5000,
+        amount: 50,
+        currency: 'EGP',
+        idempotencyKey: 'no_pay_1',
+        description: 'تسوية بدون تحديث عداد الفاتورة',
+        recordedBy: OWNER_A_UID,
+        createdAt: serverTimestamp(),
+      }
+    );
+    adjWithoutPaymentUpdate.set(
+      doc(dbOwner, 'organizations', ORG_ALPHA, 'idempotencyKeys', 'adj_no_pay_1'),
+      {
+        id: 'adj_no_pay_1',
+        organizationId: ORG_ALPHA,
+        entityType: 'ledger_entry',
+        entityId: 'ldg_adj_no_pay',
+        createdBy: OWNER_A_UID,
+        createdAt: serverTimestamp(),
+      }
+    );
+    await assertFails(adjWithoutPaymentUpdate.commit());
+
+    await assertFails(
+      updateDoc(doc(dbOwner, 'organizations', ORG_ALPHA, 'payments', 'pay_flow_1'), {
+        adjustedCreditPiasters: 5000,
+        adjustedDebitPiasters: 0,
+        lastAdjustmentEntryId: 'ldg_adj_fake',
+        updatedAt: serverTimestamp(),
+      })
+    );
+
+    // 7b. Owner valid adjustment WITH atomic payment cumulative counter + idempotencyKeys lock SUCCEEDS,
+    //     duplicate replay FAILS, and cumulative multi-adjustment overflow across different keys FAILS
     const ownerAdjBatch = writeBatch(dbOwner);
+    ownerAdjBatch.update(doc(dbOwner, 'organizations', ORG_ALPHA, 'payments', 'pay_flow_1'), {
+      adjustedCreditPiasters: 5000,
+      adjustedDebitPiasters: 0,
+      lastAdjustmentEntryId: 'ldg_adj_ok_1',
+      updatedAt: serverTimestamp(),
+    });
     ownerAdjBatch.set(doc(dbOwner, 'organizations', ORG_ALPHA, 'ledgerEntries', 'ldg_adj_ok_1'), {
       id: 'ldg_adj_ok_1',
       organizationId: ORG_ALPHA,
@@ -987,7 +1039,83 @@ describe('TEMA Firestore Security Rules — Emulator Isolation & RBAC Verificati
     });
     await assertSucceeds(ownerAdjBatch.commit());
 
+    // Second credit adjustment with different idempotencyKey within limit (50 + 450 = 500 EGP) SUCCEEDS
+    const secondAdjWithinCap = writeBatch(dbOwner);
+    secondAdjWithinCap.update(doc(dbOwner, 'organizations', ORG_ALPHA, 'payments', 'pay_flow_1'), {
+      adjustedCreditPiasters: 50000,
+      adjustedDebitPiasters: 0,
+      lastAdjustmentEntryId: 'ldg_adj_ok_2',
+      updatedAt: serverTimestamp(),
+    });
+    secondAdjWithinCap.set(doc(dbOwner, 'organizations', ORG_ALPHA, 'ledgerEntries', 'ldg_adj_ok_2'), {
+      id: 'ldg_adj_ok_2',
+      organizationId: ORG_ALPHA,
+      entryType: 'adjustment',
+      direction: 'credit',
+      entityType: 'payment',
+      entityId: 'pay_flow_1',
+      studentId: 'stu_alpha_1',
+      groupId: '',
+      amountPiasters: 45000,
+      amount: 450,
+      currency: 'EGP',
+      idempotencyKey: 'ok_2',
+      description: 'تسوية إضافية ضمن حد الفاتورة',
+      recordedBy: OWNER_A_UID,
+      createdAt: serverTimestamp(),
+    });
+    secondAdjWithinCap.set(doc(dbOwner, 'organizations', ORG_ALPHA, 'idempotencyKeys', 'adj_ok_2'), {
+      id: 'adj_ok_2',
+      organizationId: ORG_ALPHA,
+      entityType: 'ledger_entry',
+      entityId: 'ldg_adj_ok_2',
+      createdBy: OWNER_A_UID,
+      createdAt: serverTimestamp(),
+    });
+    await assertSucceeds(secondAdjWithinCap.commit());
+
+    // Third credit adjustment with new key exceeding invoice total (500 + 1 = 501 > 500 EGP) FAILS
+    const overflowAdjBatch = writeBatch(dbOwner);
+    overflowAdjBatch.update(doc(dbOwner, 'organizations', ORG_ALPHA, 'payments', 'pay_flow_1'), {
+      adjustedCreditPiasters: 50100,
+      adjustedDebitPiasters: 0,
+      lastAdjustmentEntryId: 'ldg_adj_overflow_3',
+      updatedAt: serverTimestamp(),
+    });
+    overflowAdjBatch.set(doc(dbOwner, 'organizations', ORG_ALPHA, 'ledgerEntries', 'ldg_adj_overflow_3'), {
+      id: 'ldg_adj_overflow_3',
+      organizationId: ORG_ALPHA,
+      entryType: 'adjustment',
+      direction: 'credit',
+      entityType: 'payment',
+      entityId: 'pay_flow_1',
+      studentId: 'stu_alpha_1',
+      groupId: '',
+      amountPiasters: 100,
+      amount: 1,
+      currency: 'EGP',
+      idempotencyKey: 'overflow_3',
+      description: 'محاولة تجاوز إجمالي قيمة الفاتورة',
+      recordedBy: OWNER_A_UID,
+      createdAt: serverTimestamp(),
+    });
+    overflowAdjBatch.set(doc(dbOwner, 'organizations', ORG_ALPHA, 'idempotencyKeys', 'adj_overflow_3'), {
+      id: 'adj_overflow_3',
+      organizationId: ORG_ALPHA,
+      entityType: 'ledger_entry',
+      entityId: 'ldg_adj_overflow_3',
+      createdBy: OWNER_A_UID,
+      createdAt: serverTimestamp(),
+    });
+    await assertFails(overflowAdjBatch.commit());
+
     const replayAdjBatch = writeBatch(dbOwner);
+    replayAdjBatch.update(doc(dbOwner, 'organizations', ORG_ALPHA, 'payments', 'pay_flow_1'), {
+      adjustedCreditPiasters: 55000,
+      adjustedDebitPiasters: 0,
+      lastAdjustmentEntryId: 'ldg_adj_ok_1',
+      updatedAt: serverTimestamp(),
+    });
     replayAdjBatch.set(doc(dbOwner, 'organizations', ORG_ALPHA, 'ledgerEntries', 'ldg_adj_ok_1'), {
       id: 'ldg_adj_ok_1',
       organizationId: ORG_ALPHA,
@@ -1188,5 +1316,313 @@ describe('TEMA Firestore Security Rules — Emulator Isolation & RBAC Verificati
       }
     );
     await assertSucceeds(validExpenseVoid.commit());
+  });
+
+  it('enforces Step C groups.studentCount hardening: rejects arbitrary/replay/over-capacity/cross-tenant tampering while allowing atomic enrollment lifecycle', async () => {
+    const ownerACtx = testEnv.authenticatedContext(OWNER_A_UID, {
+      email: 'owner.a@tema.edu.eg',
+      email_verified: true,
+    });
+    const assistantACtx = testEnv.authenticatedContext(ASSISTANT_A_UID, {
+      email: 'assistant.a@tema.edu.eg',
+      email_verified: true,
+    });
+
+    const dbOwner = ownerACtx.firestore();
+    const dbAssistant = assistantACtx.firestore();
+
+    await testEnv.withSecurityRulesDisabled(async (ctx) => {
+      const db = ctx.firestore();
+      await setDoc(doc(db, 'organizations', ORG_ALPHA, 'groups', 'grp_step_c_1'), {
+        id: 'grp_step_c_1',
+        organizationId: ORG_ALPHA,
+        name: 'مجموعة الكيمياء',
+        subject: 'كيمياء',
+        gradeLevel: 'الثالث الثانوي',
+        teacherId: OWNER_A_UID,
+        teacherName: 'أحمد علي',
+        capacity: 1,
+        studentCount: 0,
+        monthlyFee: 300,
+        status: 'active',
+        createdBy: OWNER_A_UID,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      await setDoc(doc(db, 'organizations', ORG_ALPHA, 'groups', 'grp_paused_c'), {
+        id: 'grp_paused_c',
+        organizationId: ORG_ALPHA,
+        name: 'مجموعة متوقفة',
+        subject: 'أحياء',
+        gradeLevel: 'الثالث الثانوي',
+        teacherId: OWNER_A_UID,
+        teacherName: 'أحمد علي',
+        capacity: 10,
+        studentCount: 0,
+        monthlyFee: 300,
+        status: 'paused',
+        createdBy: OWNER_A_UID,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      await setDoc(doc(db, 'organizations', ORG_ALPHA, 'students', 'stu_alpha_2'), {
+        id: 'stu_alpha_2',
+        organizationId: ORG_ALPHA,
+        fullName: 'سلمى إبراهيم',
+        phone: '01066665555',
+        gradeLevel: 'الثالث الثانوي',
+        status: 'active',
+        createdBy: OWNER_A_UID,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      await setDoc(doc(db, 'organizations', ORG_ALPHA, 'students', 'stu_archived_c'), {
+        id: 'stu_archived_c',
+        organizationId: ORG_ALPHA,
+        fullName: 'طالب مؤرشف',
+        phone: '01077778888',
+        gradeLevel: 'الثالث الثانوي',
+        status: 'archived',
+        createdBy: OWNER_A_UID,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    });
+
+    // 1. Even OWNER cannot directly update studentCount without atomic enrollment proof
+    await assertFails(
+      updateDoc(doc(dbOwner, 'organizations', ORG_ALPHA, 'groups', 'grp_step_c_1'), {
+        studentCount: 1,
+        updatedAt: serverTimestamp(),
+      })
+    );
+
+    // 2. Group creation with non-zero studentCount or pre-set lastEnrollmentId is REJECTED
+    await assertFails(
+      setDoc(doc(dbOwner, 'organizations', ORG_ALPHA, 'groups', 'grp_bad_init'), {
+        id: 'grp_bad_init',
+        organizationId: ORG_ALPHA,
+        name: 'مجموعة بعداد مزور',
+        subject: 'فيزياء',
+        gradeLevel: 'الثالث الثانوي',
+        teacherId: OWNER_A_UID,
+        teacherName: 'أحمد علي',
+        capacity: 10,
+        studentCount: 5,
+        monthlyFee: 300,
+        status: 'active',
+        createdBy: OWNER_A_UID,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      })
+    );
+
+    // 3. Standalone enrollment creation without atomic group studentCount +1 is REJECTED
+    await assertFails(
+      setDoc(
+        doc(dbAssistant, 'organizations', ORG_ALPHA, 'enrollments', 'grp_step_c_1_stu_alpha_1'),
+        {
+          id: 'grp_step_c_1_stu_alpha_1',
+          organizationId: ORG_ALPHA,
+          groupId: 'grp_step_c_1',
+          studentId: 'stu_alpha_1',
+          studentName: 'يوسف حسن',
+          groupName: 'مجموعة الكيمياء',
+          status: 'active',
+          enrolledBy: ASSISTANT_A_UID,
+          enrolledAt: serverTimestamp(),
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        }
+      )
+    );
+
+    // 4. Atomic enrollment of archived student is REJECTED
+    const archivedBatch = writeBatch(dbAssistant);
+    archivedBatch.set(
+      doc(dbAssistant, 'organizations', ORG_ALPHA, 'enrollments', 'grp_step_c_1_stu_archived_c'),
+      {
+        id: 'grp_step_c_1_stu_archived_c',
+        organizationId: ORG_ALPHA,
+        groupId: 'grp_step_c_1',
+        studentId: 'stu_archived_c',
+        studentName: 'طالب مؤرشف',
+        groupName: 'مجموعة الكيمياء',
+        status: 'active',
+        enrolledBy: ASSISTANT_A_UID,
+        enrolledAt: serverTimestamp(),
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }
+    );
+    archivedBatch.update(doc(dbAssistant, 'organizations', ORG_ALPHA, 'groups', 'grp_step_c_1'), {
+      studentCount: 1,
+      lastEnrollmentId: 'grp_step_c_1_stu_archived_c',
+      updatedAt: serverTimestamp(),
+    });
+    await assertFails(archivedBatch.commit());
+
+    // 5. Atomic enrollment into paused group is REJECTED
+    const pausedBatch = writeBatch(dbAssistant);
+    pausedBatch.set(
+      doc(dbAssistant, 'organizations', ORG_ALPHA, 'enrollments', 'grp_paused_c_stu_alpha_1'),
+      {
+        id: 'grp_paused_c_stu_alpha_1',
+        organizationId: ORG_ALPHA,
+        groupId: 'grp_paused_c',
+        studentId: 'stu_alpha_1',
+        studentName: 'يوسف حسن',
+        groupName: 'مجموعة متوقفة',
+        status: 'active',
+        enrolledBy: ASSISTANT_A_UID,
+        enrolledAt: serverTimestamp(),
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }
+    );
+    pausedBatch.update(doc(dbAssistant, 'organizations', ORG_ALPHA, 'groups', 'grp_paused_c'), {
+      studentCount: 1,
+      lastEnrollmentId: 'grp_paused_c_stu_alpha_1',
+      updatedAt: serverTimestamp(),
+    });
+    await assertFails(pausedBatch.commit());
+
+    // 6. Cross-org enrollment pointing to stu_beta_1 is REJECTED
+    const crossStudentBatch = writeBatch(dbAssistant);
+    crossStudentBatch.set(
+      doc(dbAssistant, 'organizations', ORG_ALPHA, 'enrollments', 'grp_step_c_1_stu_beta_1'),
+      {
+        id: 'grp_step_c_1_stu_beta_1',
+        organizationId: ORG_ALPHA,
+        groupId: 'grp_step_c_1',
+        studentId: 'stu_beta_1',
+        studentName: 'مريم عادل',
+        groupName: 'مجموعة الكيمياء',
+        status: 'active',
+        enrolledBy: ASSISTANT_A_UID,
+        enrolledAt: serverTimestamp(),
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }
+    );
+    crossStudentBatch.update(doc(dbAssistant, 'organizations', ORG_ALPHA, 'groups', 'grp_step_c_1'), {
+      studentCount: 1,
+      lastEnrollmentId: 'grp_step_c_1_stu_beta_1',
+      updatedAt: serverTimestamp(),
+    });
+    await assertFails(crossStudentBatch.commit());
+
+    // 7. Valid atomic enrollment SUCCEEDS (studentCount 0 -> 1)
+    const validEnrollBatch = writeBatch(dbAssistant);
+    validEnrollBatch.set(
+      doc(dbAssistant, 'organizations', ORG_ALPHA, 'enrollments', 'grp_step_c_1_stu_alpha_1'),
+      {
+        id: 'grp_step_c_1_stu_alpha_1',
+        organizationId: ORG_ALPHA,
+        groupId: 'grp_step_c_1',
+        studentId: 'stu_alpha_1',
+        studentName: 'يوسف حسن',
+        groupName: 'مجموعة الكيمياء',
+        status: 'active',
+        enrolledBy: ASSISTANT_A_UID,
+        enrolledAt: serverTimestamp(),
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }
+    );
+    validEnrollBatch.update(doc(dbAssistant, 'organizations', ORG_ALPHA, 'groups', 'grp_step_c_1'), {
+      studentCount: 1,
+      lastEnrollmentId: 'grp_step_c_1_stu_alpha_1',
+      updatedAt: serverTimestamp(),
+    });
+    await assertSucceeds(validEnrollBatch.commit());
+
+    // 8. Replaying already-active enrollment to inflate studentCount (+1) is REJECTED
+    await assertFails(
+      updateDoc(doc(dbOwner, 'organizations', ORG_ALPHA, 'groups', 'grp_step_c_1'), {
+        studentCount: 2,
+        lastEnrollmentId: 'grp_step_c_1_stu_alpha_1',
+        updatedAt: serverTimestamp(),
+      })
+    );
+
+    // 9. Over-capacity enrollment (capacity is 1, current count is 1) is REJECTED
+    const overCapBatch = writeBatch(dbAssistant);
+    overCapBatch.set(
+      doc(dbAssistant, 'organizations', ORG_ALPHA, 'enrollments', 'grp_step_c_1_stu_alpha_2'),
+      {
+        id: 'grp_step_c_1_stu_alpha_2',
+        organizationId: ORG_ALPHA,
+        groupId: 'grp_step_c_1',
+        studentId: 'stu_alpha_2',
+        studentName: 'سلمى إبراهيم',
+        groupName: 'مجموعة الكيمياء',
+        status: 'active',
+        enrolledBy: ASSISTANT_A_UID,
+        enrolledAt: serverTimestamp(),
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }
+    );
+    overCapBatch.update(doc(dbAssistant, 'organizations', ORG_ALPHA, 'groups', 'grp_step_c_1'), {
+      studentCount: 2,
+      lastEnrollmentId: 'grp_step_c_1_stu_alpha_2',
+      updatedAt: serverTimestamp(),
+    });
+    await assertFails(overCapBatch.commit());
+
+    // 10. Normal group metadata update (capacity 1 -> 2) with unchanged studentCount SUCCEEDS
+    await assertSucceeds(
+      updateDoc(doc(dbOwner, 'organizations', ORG_ALPHA, 'groups', 'grp_step_c_1'), {
+        capacity: 2,
+        updatedAt: serverTimestamp(),
+      })
+    );
+
+    // 11. Valid atomic removal SUCCEEDS (studentCount 1 -> 0) and replay decrement FAILS
+    const validRemoveBatch = writeBatch(dbAssistant);
+    validRemoveBatch.update(
+      doc(dbAssistant, 'organizations', ORG_ALPHA, 'enrollments', 'grp_step_c_1_stu_alpha_1'),
+      {
+        status: 'removed',
+        removedBy: ASSISTANT_A_UID,
+        removedAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }
+    );
+    validRemoveBatch.update(doc(dbAssistant, 'organizations', ORG_ALPHA, 'groups', 'grp_step_c_1'), {
+      studentCount: 0,
+      lastEnrollmentId: 'grp_step_c_1_stu_alpha_1',
+      updatedAt: serverTimestamp(),
+    });
+    await assertSucceeds(validRemoveBatch.commit());
+
+    await assertFails(
+      updateDoc(doc(dbOwner, 'organizations', ORG_ALPHA, 'groups', 'grp_step_c_1'), {
+        studentCount: 0,
+        lastEnrollmentId: 'grp_step_c_1_stu_alpha_1',
+        updatedAt: serverTimestamp(),
+      })
+    );
+
+    // 12. Valid atomic re-enrollment (removed -> active) SUCCEEDS (studentCount 0 -> 1)
+    const validReEnrollBatch = writeBatch(dbAssistant);
+    validReEnrollBatch.update(
+      doc(dbAssistant, 'organizations', ORG_ALPHA, 'enrollments', 'grp_step_c_1_stu_alpha_1'),
+      {
+        studentName: 'يوسف حسن',
+        groupName: 'مجموعة الكيمياء',
+        status: 'active',
+        enrolledBy: ASSISTANT_A_UID,
+        enrolledAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }
+    );
+    validReEnrollBatch.update(doc(dbAssistant, 'organizations', ORG_ALPHA, 'groups', 'grp_step_c_1'), {
+      studentCount: 1,
+      lastEnrollmentId: 'grp_step_c_1_stu_alpha_1',
+      updatedAt: serverTimestamp(),
+    });
+    await assertSucceeds(validReEnrollBatch.commit());
   });
 });

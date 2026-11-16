@@ -238,6 +238,98 @@ export function validateSettlementAgainstPayment(
   };
 }
 
+export interface ValidatedPaymentAdjustment {
+  amountPiasters: number;
+  amount: number;
+  cleanReason: string;
+  totalPiasters: number;
+  paidPiasters: number;
+  duePiasters: number;
+  prevAdjustedCredit: number;
+  prevAdjustedDebit: number;
+  nextAdjustedCredit: number;
+  nextAdjustedDebit: number;
+  needsPiastersBackfill: boolean;
+}
+
+export function validateAdjustmentAgainstPayment(
+  payment: PaymentRecord,
+  adjustmentAmountEgp: number,
+  direction: 'debit' | 'credit',
+  reason: string,
+  idempotencyKey?: string
+): ValidatedPaymentAdjustment {
+  if (payment.status === 'voided') {
+    throw new DomainValidationError('لا يمكن إضافة تسوية لقيد ملغى.', 'PAYMENT_VOIDED', 409);
+  }
+  if (direction !== 'debit' && direction !== 'credit') {
+    throw new DomainValidationError('اتجاه التسوية المحاسبية غير صالح.', 'INVALID_ADJUSTMENT_DIRECTION');
+  }
+
+  const cleanReason = sanitizeText(reason || '', 200);
+  if (cleanReason.length < 3) {
+    throw new DomainValidationError('يجب توضيح سبب التسوية المحاسبية.', 'ADJUSTMENT_REASON_REQUIRED');
+  }
+
+  if (
+    idempotencyKey !== undefined &&
+    idempotencyKey !== '' &&
+    (!isValidEntityId(idempotencyKey) || idempotencyKey.length > 100)
+  ) {
+    throw new DomainValidationError('مفتاح منع التكرار (idempotencyKey) غير صالح.', 'INVALID_IDEMPOTENCY_KEY');
+  }
+
+  const amountPiasters = egpToPiasters(adjustmentAmountEgp, {
+    allowZero: false,
+    fieldLabel: 'قيمة التسوية',
+  });
+  const totalPiasters = resolveRecordPiasters(payment.amountPiasters, payment.amount);
+  const paidPiasters = resolveRecordPiasters(payment.paidAmountPiasters, payment.paidAmount);
+  const duePiasters = Math.max(0, totalPiasters - paidPiasters);
+
+  const prevAdjustedCredit =
+    typeof payment.adjustedCreditPiasters === 'number' && payment.adjustedCreditPiasters >= 0
+      ? payment.adjustedCreditPiasters
+      : 0;
+  const prevAdjustedDebit =
+    typeof payment.adjustedDebitPiasters === 'number' && payment.adjustedDebitPiasters >= 0
+      ? payment.adjustedDebitPiasters
+      : 0;
+
+  const nextAdjustedCredit =
+    direction === 'credit' ? prevAdjustedCredit + amountPiasters : prevAdjustedCredit;
+  const nextAdjustedDebit =
+    direction === 'debit' ? prevAdjustedDebit + amountPiasters : prevAdjustedDebit;
+
+  if (direction === 'credit' && nextAdjustedCredit > totalPiasters) {
+    throw new DomainValidationError(
+      'مجموع التسويات الدائنة يتجاوز إجمالي قيمة الفاتورة.',
+      'ADJUSTMENT_EXCEEDS_PAYMENT'
+    );
+  }
+
+  if (direction === 'debit' && nextAdjustedDebit > totalPiasters) {
+    throw new DomainValidationError(
+      'مجموع التسويات المدينة يتجاوز إجمالي قيمة الفاتورة.',
+      'ADJUSTMENT_EXCEEDS_PAYMENT'
+    );
+  }
+
+  return {
+    amountPiasters,
+    amount: piastersToEgp(amountPiasters),
+    cleanReason,
+    totalPiasters,
+    paidPiasters,
+    duePiasters,
+    prevAdjustedCredit,
+    prevAdjustedDebit,
+    nextAdjustedCredit,
+    nextAdjustedDebit,
+    needsPiastersBackfill: typeof payment.amountPiasters !== 'number',
+  };
+}
+
 export interface StudentLedgerBalance {
   studentId: string;
   totalChargedPiasters: number;

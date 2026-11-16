@@ -615,4 +615,49 @@ describe('TEMA Gemini Backend Security Controls', () => {
     expect(financeService).toContain('`${expenseId}_rev_charge`');
     expect(financeService).toContain('`ldg_adj_${effectiveKey}`');
   });
+
+  it('12. Step C groups.studentCount hardening & Step B cumulative payment adjustment limits are enforced in rules, domain, services, and API', () => {
+    const rules = fs.readFileSync(path.resolve(process.cwd(), 'firestore.rules'), 'utf8');
+    const ledgerDomain = fs.readFileSync(
+      path.resolve(process.cwd(), 'src/lib/domain/ledger.ts'),
+      'utf8'
+    );
+    const financeService = fs.readFileSync(
+      path.resolve(process.cwd(), 'src/services/financeService.ts'),
+      'utf8'
+    );
+    const groupService = fs.readFileSync(
+      path.resolve(process.cwd(), 'src/services/groupService.ts'),
+      'utf8'
+    );
+    const reconciliationService = fs.readFileSync(
+      path.resolve(process.cwd(), 'src/services/reconciliationService.ts'),
+      'utf8'
+    );
+    const temaRoutes = fs.readFileSync(
+      path.resolve(process.cwd(), 'server/api/temaRoutes.ts'),
+      'utf8'
+    );
+
+    // Step C: no open owner/accountant studentCount bypass, strict two-way group <-> enrollment coupling
+    expect(rules).not.toContain("affectedKeys().hasOnly(['studentCount', 'updatedAt'])");
+    expect(rules).toContain('function isValidGroupEnrollmentIncrement(orgId, groupId)');
+    expect(rules).toContain('function isValidGroupEnrollmentDecrement(orgId, groupId)');
+    expect(rules).toContain('function isValidEnrollmentGroupLinkOnActivate(orgId, enrollmentId)');
+    expect(rules).toContain('function isValidEnrollmentGroupLinkOnRemove(orgId, enrollmentId)');
+    expect(rules).toContain('&& !(\'lastEnrollmentId\' in incoming())');
+    expect(groupService).toContain('lastEnrollmentId: enrollmentId');
+    expect(temaRoutes).toContain('lastEnrollmentId: enrollmentId');
+    expect(reconciliationService).toContain('/api/v1/organizations/${encodeURIComponent(organizationId)}/reconcile');
+    expect(temaRoutes).toContain('adminCommitWrites');
+
+    // Step B residual risk: cumulative adjustment counters enforced across rules, domain, service, and REST API
+    expect(rules).toContain('function isValidPaymentAdjustmentCounterUpdate(orgId, paymentId)');
+    expect(rules).toContain('adjustedCreditPiasters <= incoming().amountPiasters');
+    expect(rules).toContain('adjustedDebitPiasters <= incoming().amountPiasters');
+    expect(ledgerDomain).toContain('export function validateAdjustmentAgainstPayment(');
+    expect(financeService).toContain('validateAdjustmentAgainstPayment(');
+    expect(temaRoutes).toContain("'/organizations/:orgId/payments/:paymentId/adjust'");
+    expect(temaRoutes).toContain('validateAdjustmentAgainstPayment(');
+  });
 });

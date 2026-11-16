@@ -189,6 +189,9 @@ export interface PaymentRecord {
   amountPiasters?: number;
   paidAmountPiasters?: number;
   dueAmountPiasters?: number;
+  adjustedCreditPiasters?: number;
+  adjustedDebitPiasters?: number;
+  lastAdjustmentEntryId?: string;
   currency: 'EGP';
   category: PaymentCategory;
   method: PaymentMethod;

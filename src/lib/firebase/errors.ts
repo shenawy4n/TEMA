@@ -61,14 +61,27 @@ export function getArabicErrorMessage(error: unknown): string {
     return error.message;
   }
   if (error instanceof Error) {
+    const code =
+      'code' in error && typeof (error as { code?: unknown }).code === 'string'
+        ? (error as { code: string }).code
+        : '';
     const msg = error.message;
-    if (msg.includes('permission-denied') || msg.includes('Missing or insufficient permissions')) {
+    if (
+      code === 'permission-denied' ||
+      msg.includes('permission-denied') ||
+      msg.includes('Missing or insufficient permissions')
+    ) {
       return 'ليس لديك صلاحية كافية لتنفيذ هذا الإجراء أو الوصول إلى هذه البيانات.';
     }
     if (msg.includes('Quota exceeded')) {
       return 'تم تجاوز الحد اليومي المجاني لعمليات قاعدة البيانات. يرجى المحاولة لاحقاً أو ترقية الخطة.';
     }
-    if (msg.includes('the client is offline') || msg.includes('unavailable') || msg.includes('network-request-failed')) {
+    if (
+      code === 'unavailable' ||
+      msg.includes('the client is offline') ||
+      msg.includes('unavailable') ||
+      msg.includes('network-request-failed')
+    ) {
       return 'تعذر الاتصال بالشبكة. يرجى التحقق من اتصالك بالإنترنت والمحاولة مرة أخرى.';
     }
     if (msg.includes('auth/operation-not-allowed')) {

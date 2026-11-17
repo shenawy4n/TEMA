@@ -1625,4 +1625,424 @@ describe('TEMA Firestore Security Rules — Emulator Isolation & RBAC Verificati
     });
     await assertSucceeds(validReEnrollBatch.commit());
   });
+
+  it('enforces Step D financial integrity: EGP/piaster consistency, active-student & enrollment checks, two-way ledger/idempotency coupling, and legacy backfill', async () => {
+    const ownerACtx = testEnv.authenticatedContext(OWNER_A_UID, {
+      email: 'owner.a@tema.edu.eg',
+      email_verified: true,
+    });
+    const assistantACtx = testEnv.authenticatedContext(ASSISTANT_A_UID, {
+      email: 'assistant.a@tema.edu.eg',
+      email_verified: true,
+    });
+
+    const dbOwner = ownerACtx.firestore();
+    const dbAssistant = assistantACtx.firestore();
+
+    await testEnv.withSecurityRulesDisabled(async (ctx) => {
+      const db = ctx.firestore();
+      await setDoc(doc(db, 'organizations', ORG_ALPHA, 'students', 'stu_archived_d'), {
+        id: 'stu_archived_d',
+        organizationId: ORG_ALPHA,
+        fullName: 'طالب مؤرشف مالي',
+        phone: '01099990001',
+        gradeLevel: 'الثالث الثانوي',
+        status: 'archived',
+        createdBy: OWNER_A_UID,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      await setDoc(doc(db, 'organizations', ORG_ALPHA, 'students', 'stu_inactive_d'), {
+        id: 'stu_inactive_d',
+        organizationId: ORG_ALPHA,
+        fullName: 'طالب موقوف مالي',
+        phone: '01099990002',
+        gradeLevel: 'الثالث الثانوي',
+        status: 'inactive',
+        createdBy: OWNER_A_UID,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      await setDoc(doc(db, 'organizations', ORG_ALPHA, 'groups', 'grp_d_1'), {
+        id: 'grp_d_1',
+        organizationId: ORG_ALPHA,
+        name: 'مجموعة جبر',
+        subject: 'رياضيات',
+        gradeLevel: 'الثالث الثانوي',
+        teacherId: OWNER_A_UID,
+        teacherName: 'أحمد علي',
+        capacity: 10,
+        studentCount: 0,
+        monthlyFee: 400,
+        status: 'active',
+        createdBy: OWNER_A_UID,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      // Legacy payment record missing *Piasters fields
+      await setDoc(doc(db, 'organizations', ORG_ALPHA, 'payments', 'pay_legacy_d'), {
+        id: 'pay_legacy_d',
+        organizationId: ORG_ALPHA,
+        studentId: 'stu_alpha_1',
+        studentName: 'يوسف حسن',
+        amount: 300,
+        paidAmount: 100,
+        dueAmount: 200,
+        currency: 'EGP',
+        category: 'tuition',
+        method: 'cash',
+        status: 'partial',
+        recordedBy: OWNER_A_UID,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      // Legacy expense record missing amountPiasters
+      await setDoc(doc(db, 'organizations', ORG_ALPHA, 'expenses', 'exp_legacy_d'), {
+        id: 'exp_legacy_d',
+        organizationId: ORG_ALPHA,
+        title: 'مصروف قديم',
+        category: 'other',
+        amount: 150,
+        currency: 'EGP',
+        status: 'posted',
+        expenseDate: '2026-10-05',
+        recordedBy: OWNER_A_UID,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    });
+
+    // 1. Payment with mismatched amount <-> amountPiasters is REJECTED
+    const mismatchPayBatch = writeBatch(dbAssistant);
+    mismatchPayBatch.set(doc(dbAssistant, 'organizations', ORG_ALPHA, 'payments', 'pay_d_mismatch'), {
+      id: 'pay_d_mismatch',
+      organizationId: ORG_ALPHA,
+      studentId: 'stu_alpha_1',
+      studentName: 'يوسف حسن',
+      groupId: '',
+      amount: 1, // mismatched vs 50000 piasters!
+      paidAmount: 0,
+      dueAmount: 1,
+      amountPiasters: 50000,
+      paidAmountPiasters: 0,
+      dueAmountPiasters: 50000,
+      currency: 'EGP',
+      category: 'tuition',
+      method: 'cash',
+      status: 'pending',
+      recordedBy: ASSISTANT_A_UID,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    mismatchPayBatch.set(
+      doc(dbAssistant, 'organizations', ORG_ALPHA, 'ledgerEntries', 'pay_d_mismatch_charge'),
+      {
+        id: 'pay_d_mismatch_charge',
+        organizationId: ORG_ALPHA,
+        entryType: 'charge',
+        direction: 'debit',
+        entityType: 'payment',
+        entityId: 'pay_d_mismatch',
+        studentId: 'stu_alpha_1',
+        amountPiasters: 50000,
+        amount: 500,
+        currency: 'EGP',
+        description: 'مبلغ غير متسق',
+        recordedBy: ASSISTANT_A_UID,
+        createdAt: serverTimestamp(),
+      }
+    );
+    await assertFails(mismatchPayBatch.commit());
+
+    // 2. Payment against archived OR inactive student is REJECTED
+    for (const [stuId, payId] of [
+      ['stu_archived_d', 'pay_d_arch'],
+      ['stu_inactive_d', 'pay_d_inact'],
+    ] as const) {
+      const badStuBatch = writeBatch(dbAssistant);
+      badStuBatch.set(doc(dbAssistant, 'organizations', ORG_ALPHA, 'payments', payId), {
+        id: payId,
+        organizationId: ORG_ALPHA,
+        studentId: stuId,
+        studentName: 'طالب غير نشط',
+        groupId: '',
+        amount: 200,
+        paidAmount: 200,
+        dueAmount: 0,
+        amountPiasters: 20000,
+        paidAmountPiasters: 20000,
+        dueAmountPiasters: 0,
+        currency: 'EGP',
+        category: 'tuition',
+        method: 'cash',
+        status: 'posted',
+        recordedBy: ASSISTANT_A_UID,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      badStuBatch.set(doc(dbAssistant, 'organizations', ORG_ALPHA, 'ledgerEntries', `${payId}_charge`), {
+        id: `${payId}_charge`,
+        organizationId: ORG_ALPHA,
+        entryType: 'charge',
+        direction: 'debit',
+        entityType: 'payment',
+        entityId: payId,
+        studentId: stuId,
+        amountPiasters: 20000,
+        amount: 200,
+        currency: 'EGP',
+        description: 'محاولة تحصيل لطالب غير نشط',
+        recordedBy: ASSISTANT_A_UID,
+        createdAt: serverTimestamp(),
+      });
+      badStuBatch.set(doc(dbAssistant, 'organizations', ORG_ALPHA, 'ledgerEntries', `${payId}_pay_init`), {
+        id: `${payId}_pay_init`,
+        organizationId: ORG_ALPHA,
+        entryType: 'payment',
+        direction: 'credit',
+        entityType: 'payment',
+        entityId: payId,
+        studentId: stuId,
+        relatedEntryId: `${payId}_charge`,
+        amountPiasters: 20000,
+        amount: 200,
+        currency: 'EGP',
+        description: 'محاولة تحصيل',
+        recordedBy: ASSISTANT_A_UID,
+        createdAt: serverTimestamp(),
+      });
+      await assertFails(badStuBatch.commit());
+    }
+
+    // 3. Payment referencing group where student is NOT enrolled is REJECTED
+    const unenrolledGroupBatch = writeBatch(dbAssistant);
+    unenrolledGroupBatch.set(doc(dbAssistant, 'organizations', ORG_ALPHA, 'payments', 'pay_d_badgrp'), {
+      id: 'pay_d_badgrp',
+      organizationId: ORG_ALPHA,
+      studentId: 'stu_alpha_1',
+      studentName: 'يوسف حسن',
+      groupId: 'grp_d_1',
+      amount: 200,
+      paidAmount: 0,
+      dueAmount: 200,
+      amountPiasters: 20000,
+      paidAmountPiasters: 0,
+      dueAmountPiasters: 20000,
+      currency: 'EGP',
+      category: 'tuition',
+      method: 'cash',
+      status: 'pending',
+      recordedBy: ASSISTANT_A_UID,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    unenrolledGroupBatch.set(
+      doc(dbAssistant, 'organizations', ORG_ALPHA, 'ledgerEntries', 'pay_d_badgrp_charge'),
+      {
+        id: 'pay_d_badgrp_charge',
+        organizationId: ORG_ALPHA,
+        entryType: 'charge',
+        direction: 'debit',
+        entityType: 'payment',
+        entityId: 'pay_d_badgrp',
+        studentId: 'stu_alpha_1',
+        groupId: 'grp_d_1',
+        amountPiasters: 20000,
+        amount: 200,
+        currency: 'EGP',
+        description: 'مجموعة غير مسجل بها',
+        recordedBy: ASSISTANT_A_UID,
+        createdAt: serverTimestamp(),
+      }
+    );
+    await assertFails(unenrolledGroupBatch.commit());
+
+    // 4. Standalone Payment create WITHOUT ledgerEntries, and standalone Payment void WITHOUT reversals are REJECTED
+    await assertFails(
+      setDoc(doc(dbAssistant, 'organizations', ORG_ALPHA, 'payments', 'pay_d_noledger'), {
+        id: 'pay_d_noledger',
+        organizationId: ORG_ALPHA,
+        studentId: 'stu_alpha_1',
+        studentName: 'يوسف حسن',
+        groupId: '',
+        amount: 200,
+        paidAmount: 0,
+        dueAmount: 200,
+        amountPiasters: 20000,
+        paidAmountPiasters: 0,
+        dueAmountPiasters: 20000,
+        currency: 'EGP',
+        category: 'tuition',
+        method: 'cash',
+        status: 'pending',
+        recordedBy: ASSISTANT_A_UID,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      })
+    );
+    await assertFails(
+      updateDoc(doc(dbOwner, 'organizations', ORG_ALPHA, 'payments', 'pay_alpha_1'), {
+        status: 'voided',
+        voidReason: 'إلغاء بدون قيد عكسي',
+        voidedBy: OWNER_A_UID,
+        voidedAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      })
+    );
+
+    // 5. Expense with mismatched amount <-> amountPiasters or standalone create without ledger is REJECTED
+    const badExpBatch = writeBatch(dbOwner);
+    badExpBatch.set(doc(dbOwner, 'organizations', ORG_ALPHA, 'expenses', 'exp_d_mismatch'), {
+      id: 'exp_d_mismatch',
+      organizationId: ORG_ALPHA,
+      title: 'مصروف متلاعب به',
+      category: 'other',
+      amount: 100,
+      amountPiasters: 50000,
+      currency: 'EGP',
+      status: 'posted',
+      expenseDate: '2026-11-17',
+      recordedBy: OWNER_A_UID,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    badExpBatch.set(
+      doc(dbOwner, 'organizations', ORG_ALPHA, 'ledgerEntries', 'exp_d_mismatch_charge'),
+      {
+        id: 'exp_d_mismatch_charge',
+        organizationId: ORG_ALPHA,
+        entryType: 'charge',
+        direction: 'debit',
+        entityType: 'expense',
+        entityId: 'exp_d_mismatch',
+        amountPiasters: 50000,
+        amount: 500,
+        currency: 'EGP',
+        description: 'مبلغ مصروف متضارب',
+        recordedBy: OWNER_A_UID,
+        createdAt: serverTimestamp(),
+      }
+    );
+    await assertFails(badExpBatch.commit());
+
+    await assertFails(
+      setDoc(doc(dbOwner, 'organizations', ORG_ALPHA, 'expenses', 'exp_d_noledger'), {
+        id: 'exp_d_noledger',
+        organizationId: ORG_ALPHA,
+        title: 'مصروف بدون قيد',
+        category: 'other',
+        amount: 100,
+        amountPiasters: 10000,
+        currency: 'EGP',
+        status: 'posted',
+        expenseDate: '2026-11-17',
+        recordedBy: OWNER_A_UID,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      })
+    );
+
+    // 6. Legacy payment settle with exact backfill SUCCEEDS; tampered piasters backfill FAILS
+    const badLegacySettle = writeBatch(dbAssistant);
+    badLegacySettle.update(doc(dbAssistant, 'organizations', ORG_ALPHA, 'payments', 'pay_legacy_d'), {
+      amountPiasters: 10000, // tampered! existing.amount is 300
+      paidAmount: 300,
+      dueAmount: 0,
+      paidAmountPiasters: 10000,
+      dueAmountPiasters: 0,
+      status: 'posted',
+      method: 'cash',
+      updatedAt: serverTimestamp(),
+    });
+    badLegacySettle.set(
+      doc(dbAssistant, 'organizations', ORG_ALPHA, 'ledgerEntries', 'pay_legacy_d_pay_10000'),
+      {
+        id: 'pay_legacy_d_pay_10000',
+        organizationId: ORG_ALPHA,
+        entryType: 'payment',
+        direction: 'credit',
+        entityType: 'payment',
+        entityId: 'pay_legacy_d',
+        studentId: 'stu_alpha_1',
+        amountPiasters: 20000,
+        amount: 200,
+        currency: 'EGP',
+        description: 'تزوير سداده قديمة',
+        recordedBy: ASSISTANT_A_UID,
+        createdAt: serverTimestamp(),
+      }
+    );
+    await assertFails(badLegacySettle.commit());
+
+    const goodLegacySettle = writeBatch(dbAssistant);
+    goodLegacySettle.update(doc(dbAssistant, 'organizations', ORG_ALPHA, 'payments', 'pay_legacy_d'), {
+      amountPiasters: 30000,
+      paidAmount: 300,
+      dueAmount: 0,
+      paidAmountPiasters: 30000,
+      dueAmountPiasters: 0,
+      status: 'posted',
+      method: 'cash',
+      updatedAt: serverTimestamp(),
+    });
+    goodLegacySettle.set(
+      doc(dbAssistant, 'organizations', ORG_ALPHA, 'ledgerEntries', 'pay_legacy_d_pay_30000'),
+      {
+        id: 'pay_legacy_d_pay_30000',
+        organizationId: ORG_ALPHA,
+        entryType: 'payment',
+        direction: 'credit',
+        entityType: 'payment',
+        entityId: 'pay_legacy_d',
+        studentId: 'stu_alpha_1',
+        amountPiasters: 20000,
+        amount: 200,
+        currency: 'EGP',
+        description: 'سداد متبقي لدفعة قديمة',
+        recordedBy: ASSISTANT_A_UID,
+        createdAt: serverTimestamp(),
+      }
+    );
+    await assertSucceeds(goodLegacySettle.commit());
+
+    // 7. Legacy expense void with exact backfill + reversal SUCCEEDS; assistant void FAILS
+    await assertFails(
+      updateDoc(doc(dbAssistant, 'organizations', ORG_ALPHA, 'expenses', 'exp_legacy_d'), {
+        status: 'voided',
+        amountPiasters: 15000,
+        voidReason: 'محاولة إلغاء من مساعد',
+        voidedBy: ASSISTANT_A_UID,
+        voidedAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      })
+    );
+
+    const goodLegacyVoidExp = writeBatch(dbOwner);
+    goodLegacyVoidExp.update(doc(dbOwner, 'organizations', ORG_ALPHA, 'expenses', 'exp_legacy_d'), {
+      amountPiasters: 15000,
+      status: 'voided',
+      voidReason: 'إلغاء مصروف قديم متوافق',
+      voidedBy: OWNER_A_UID,
+      voidedAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    goodLegacyVoidExp.set(
+      doc(dbOwner, 'organizations', ORG_ALPHA, 'ledgerEntries', 'exp_legacy_d_rev_charge'),
+      {
+        id: 'exp_legacy_d_rev_charge',
+        organizationId: ORG_ALPHA,
+        entryType: 'reversal',
+        direction: 'credit',
+        entityType: 'expense',
+        entityId: 'exp_legacy_d',
+        amountPiasters: 15000,
+        amount: 150,
+        currency: 'EGP',
+        description: 'عكس مصروف قديم',
+        recordedBy: OWNER_A_UID,
+        createdAt: serverTimestamp(),
+      }
+    );
+    await assertSucceeds(goodLegacyVoidExp.commit());
+  });
 });

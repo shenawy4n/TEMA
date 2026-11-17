@@ -132,3 +132,139 @@ export function computePaymentBreakdown(
     status,
   };
 }
+
+export interface ValidatedStoredPaymentAmounts {
+  amountPiasters: number;
+  paidAmountPiasters: number;
+  dueAmountPiasters: number;
+  needsBackfill: {
+    amountPiasters: boolean;
+    paidAmountPiasters: boolean;
+    dueAmountPiasters: boolean;
+  };
+}
+
+/**
+ * Validates and resolves exact integer piasters for an existing or legacy PaymentRecord.
+ * Rejects corrupted/inconsistent amount <-> amountPiasters pairs and ensures legacy docs
+ * without *Piasters cannot bypass financial invariants via zero defaults.
+ */
+export function resolveValidatedPaymentPiasters(record: {
+  amount: unknown;
+  paidAmount: unknown;
+  dueAmount?: unknown;
+  amountPiasters?: unknown;
+  paidAmountPiasters?: unknown;
+  dueAmountPiasters?: unknown;
+}): ValidatedStoredPaymentAmounts {
+  const hasExplicitAmount = typeof record.amountPiasters === 'number';
+  const hasExplicitPaid = typeof record.paidAmountPiasters === 'number';
+  const hasExplicitDue = typeof record.dueAmountPiasters === 'number';
+
+  const derivedAmount = egpToPiasters(record.amount, {
+    allowZero: false,
+    fieldLabel: 'إجمالي الفاتورة',
+  });
+  const derivedPaid = egpToPiasters(record.paidAmount, {
+    allowZero: true,
+    fieldLabel: 'المبلغ المحصّل',
+  });
+
+  if (hasExplicitAmount) {
+    const explicit = assertPositivePiasters(record.amountPiasters, 'إجمالي الفاتورة بالقرش');
+    if (explicit !== derivedAmount) {
+      throw new DomainValidationError(
+        'عدم تطابق بين إجمالي الفاتورة بالجنيه وبالقرش.',
+        'AMOUNT_PIASTERS_MISMATCH',
+        409
+      );
+    }
+  }
+
+  if (hasExplicitPaid) {
+    const explicitPaid = assertNonNegativePiasters(record.paidAmountPiasters, 'المبلغ المحصّل بالقرش');
+    if (explicitPaid !== derivedPaid) {
+      throw new DomainValidationError(
+        'عدم تطابق بين المبلغ المحصّل بالجنيه وبالقرش.',
+        'PAID_PIASTERS_MISMATCH',
+        409
+      );
+    }
+  }
+
+  if (derivedPaid > derivedAmount) {
+    throw new DomainValidationError(
+      'سجل الدفعة غير متسق: المبلغ المحصّل يتجاوز إجمالي الفاتورة.',
+      'INCONSISTENT_PAYMENT_RECORD',
+      409
+    );
+  }
+
+  const expectedDue = derivedAmount - derivedPaid;
+  if (typeof record.dueAmount === 'number') {
+    const derivedDue = egpToPiasters(record.dueAmount, {
+      allowZero: true,
+      fieldLabel: 'المبلغ المتبقي',
+    });
+    if (derivedDue !== expectedDue) {
+      throw new DomainValidationError(
+        'عدم تطابق بين المبلغ المتبقي وبقية مبالغ الفاتورة.',
+        'DUE_PIASTERS_MISMATCH',
+        409
+      );
+    }
+  }
+
+  if (hasExplicitDue) {
+    const explicitDue = assertNonNegativePiasters(record.dueAmountPiasters, 'المبلغ المتبقي بالقرش');
+    if (explicitDue !== expectedDue) {
+      throw new DomainValidationError(
+        'عدم تطابق في رصيد الاستحقاق المتبقي بالقرش.',
+        'DUE_PIASTERS_MISMATCH',
+        409
+      );
+    }
+  }
+
+  return {
+    amountPiasters: derivedAmount,
+    paidAmountPiasters: derivedPaid,
+    dueAmountPiasters: expectedDue,
+    needsBackfill: {
+      amountPiasters: !hasExplicitAmount,
+      paidAmountPiasters: !hasExplicitPaid,
+      dueAmountPiasters: !hasExplicitDue,
+    },
+  };
+}
+
+/**
+ * Validates and resolves exact integer piasters for an existing or legacy ExpenseRecord.
+ */
+export function resolveValidatedExpensePiasters(record: {
+  amount: unknown;
+  amountPiasters?: unknown;
+}): {
+  amountPiasters: number;
+  needsBackfill: boolean;
+} {
+  const derivedAmount = egpToPiasters(record.amount, {
+    allowZero: false,
+    fieldLabel: 'قيمة المصروف',
+  });
+  const hasExplicit = typeof record.amountPiasters === 'number';
+  if (hasExplicit) {
+    const explicit = assertPositivePiasters(record.amountPiasters, 'قيمة المصروف بالقرش');
+    if (explicit !== derivedAmount) {
+      throw new DomainValidationError(
+        'عدم تطابق بين قيمة المصروف بالجنيه وبالقرش.',
+        'EXPENSE_PIASTERS_MISMATCH',
+        409
+      );
+    }
+  }
+  return {
+    amountPiasters: derivedAmount,
+    needsBackfill: !hasExplicit,
+  };
+}

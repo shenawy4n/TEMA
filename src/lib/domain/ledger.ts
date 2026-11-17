@@ -15,6 +15,7 @@ import {
   egpToPiasters,
   piastersToEgp,
   resolveRecordPiasters,
+  resolveValidatedPaymentPiasters,
 } from './money';
 import { isValidCalendarDate } from './scheduling';
 
@@ -191,12 +192,14 @@ export function validateSettlementAgainstPayment(
   installmentAmountEgp: number,
   method: PaymentMethod
 ): {
+  totalPiasters: number;
   installmentPiasters: number;
   newPaidPiasters: number;
   newDuePiasters: number;
   newPaidAmount: number;
   newDueAmount: number;
   nextStatus: 'posted' | 'partial';
+  needsAmountBackfill: boolean;
 } {
   if (payment.status === 'voided') {
     throw new DomainValidationError('لا يمكن سداد قيد مالي ملغى.', 'PAYMENT_VOIDED', 409);
@@ -208,9 +211,10 @@ export function validateSettlementAgainstPayment(
     throw new DomainValidationError('طريقة الدفع غير صالحة.', 'INVALID_PAYMENT_METHOD');
   }
 
-  const totalPiasters = resolveRecordPiasters(payment.amountPiasters, payment.amount);
-  const currentPaidPiasters = resolveRecordPiasters(payment.paidAmountPiasters, payment.paidAmount);
-  const currentDuePiasters = Math.max(0, totalPiasters - currentPaidPiasters);
+  const stored = resolveValidatedPaymentPiasters(payment);
+  const totalPiasters = stored.amountPiasters;
+  const currentPaidPiasters = stored.paidAmountPiasters;
+  const currentDuePiasters = stored.dueAmountPiasters;
 
   const installmentPiasters = egpToPiasters(installmentAmountEgp, {
     allowZero: false,
@@ -229,12 +233,14 @@ export function validateSettlementAgainstPayment(
   const nextStatus = newDuePiasters === 0 ? 'posted' : 'partial';
 
   return {
+    totalPiasters,
     installmentPiasters,
     newPaidPiasters,
     newDuePiasters,
     newPaidAmount: newPaidPiasters / PIASTERS_PER_EGP,
     newDueAmount: newDuePiasters / PIASTERS_PER_EGP,
     nextStatus,
+    needsAmountBackfill: stored.needsBackfill.amountPiasters,
   };
 }
 
@@ -283,16 +289,21 @@ export function validateAdjustmentAgainstPayment(
     allowZero: false,
     fieldLabel: 'قيمة التسوية',
   });
-  const totalPiasters = resolveRecordPiasters(payment.amountPiasters, payment.amount);
-  const paidPiasters = resolveRecordPiasters(payment.paidAmountPiasters, payment.paidAmount);
-  const duePiasters = Math.max(0, totalPiasters - paidPiasters);
+  const stored = resolveValidatedPaymentPiasters(payment);
+  const totalPiasters = stored.amountPiasters;
+  const paidPiasters = stored.paidAmountPiasters;
+  const duePiasters = stored.dueAmountPiasters;
 
   const prevAdjustedCredit =
-    typeof payment.adjustedCreditPiasters === 'number' && payment.adjustedCreditPiasters >= 0
+    typeof payment.adjustedCreditPiasters === 'number' &&
+    Number.isSafeInteger(payment.adjustedCreditPiasters) &&
+    payment.adjustedCreditPiasters >= 0
       ? payment.adjustedCreditPiasters
       : 0;
   const prevAdjustedDebit =
-    typeof payment.adjustedDebitPiasters === 'number' && payment.adjustedDebitPiasters >= 0
+    typeof payment.adjustedDebitPiasters === 'number' &&
+    Number.isSafeInteger(payment.adjustedDebitPiasters) &&
+    payment.adjustedDebitPiasters >= 0
       ? payment.adjustedDebitPiasters
       : 0;
 
@@ -326,7 +337,10 @@ export function validateAdjustmentAgainstPayment(
     prevAdjustedDebit,
     nextAdjustedCredit,
     nextAdjustedDebit,
-    needsPiastersBackfill: typeof payment.amountPiasters !== 'number',
+    needsPiastersBackfill:
+      stored.needsBackfill.amountPiasters ||
+      stored.needsBackfill.paidAmountPiasters ||
+      stored.needsBackfill.dueAmountPiasters,
   };
 }
 

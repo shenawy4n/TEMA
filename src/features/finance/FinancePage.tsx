@@ -108,9 +108,9 @@ export function FinancePage() {
       setPayments(payData);
       setExpenses(expData);
       setLedgerEntries(ledgerData);
-      setStudents(stuData.filter((s) => s.status !== 'archived'));
+      setStudents(stuData.filter((s) => s.status === 'active'));
       if (stuData.length > 0 && !studentId) {
-        const firstActive = stuData.find((s) => s.status !== 'archived');
+        const firstActive = stuData.find((s) => s.status === 'active');
         if (firstActive) setStudentId(firstActive.id);
       }
     } catch (err) {

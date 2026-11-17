@@ -311,9 +311,12 @@ service cloud.firestore {
         && data.amount is number && data.amount > 0
         && data.paidAmount is number && data.paidAmount >= 0 && data.paidAmount <= data.amount
         && data.dueAmount is number && data.dueAmount >= 0
-        && isPosInt(data.amountPiasters)
-        && isNonNegInt(data.paidAmountPiasters)
-        && isNonNegInt(data.dueAmountPiasters)
+        && isPosInt(data.amountPiasters) && data.amountPiasters <= 100000000
+        && isNonNegInt(data.paidAmountPiasters) && data.paidAmountPiasters <= 100000000
+        && isNonNegInt(data.dueAmountPiasters) && data.dueAmountPiasters <= 100000000
+        && math.abs((data.amount * 100) - data.amountPiasters) < 0.001
+        && math.abs((data.paidAmount * 100) - data.paidAmountPiasters) < 0.001
+        && math.abs((data.dueAmount * 100) - data.dueAmountPiasters) < 0.001
         && data.paidAmountPiasters <= data.amountPiasters
         && (data.paidAmountPiasters + data.dueAmountPiasters) == data.amountPiasters
         && (!('adjustedCreditPiasters' in data) || (isNonNegInt(data.adjustedCreditPiasters) && data.adjustedCreditPiasters <= data.amountPiasters))
@@ -329,7 +332,7 @@ service cloud.firestore {
           || (data.status == 'partial' && data.paidAmountPiasters > 0 && data.dueAmountPiasters > 0)
           || (data.status == 'pending' && data.paidAmountPiasters == 0 && data.dueAmountPiasters == data.amountPiasters)
         )
-        && (!('paymentDate' in data) || (data.paymentDate is string && data.paymentDate.matches('^\\d{4}-\\d{2}-\\d{2}$')))
+        && (!('paymentDate' in data) || (data.paymentDate is string && data.paymentDate.size() == 10 && data.paymentDate.matches('^\\d{4}-\\d{2}-\\d{2}$')))
         && (!('referenceNumber' in data) || isStrLen(data.referenceNumber, 0, 80))
         && (!('idempotencyKey' in data) || isValidId(data.idempotencyKey))
         && (!('notes' in data) || isStrLen(data.notes, 0, 300))
@@ -359,6 +362,8 @@ service cloud.firestore {
         && data.category in ['rent', 'salaries', 'utilities', 'printing', 'marketing', 'other']
         && data.amount is number && data.amount > 0
         && isPosInt(data.amountPiasters)
+        && data.amountPiasters <= 100000000
+        && math.abs((data.amount * 100) - data.amountPiasters) < 0.001
         && data.currency == 'EGP'
         && data.status in ['posted', 'voided']
         && data.expenseDate is string && data.expenseDate.size() == 10 && data.expenseDate.matches('^\\d{4}-\\d{2}-\\d{2}$')
@@ -398,6 +403,7 @@ service cloud.firestore {
         && (!('studentName' in data) || isStrLen(data.studentName, 1, 120))
         && (!('groupId' in data) || data.groupId == '' || isValidId(data.groupId))
         && isPosInt(data.amountPiasters)
+        && data.amountPiasters <= 100000000
         && data.amount is number && data.amount > 0
         && math.abs((data.amount * 100) - data.amountPiasters) < 0.001
         && data.currency == 'EGP'
@@ -1133,7 +1139,7 @@ service cloud.firestore {
       }
 
       // -----------------------------------------------------------------------
-      // Payments (Immutable once posted/voided; settlements only on pending/partial)
+      // Payments (Active student only on create; two-way atomic coupling to ledgerEntries)
       // -----------------------------------------------------------------------
       match /payments/{paymentId} {
         allow get: if isValidId(organizationId) && isValidId(paymentId) && hasAnyRole(organizationId, ['owner', 'accountant', 'assistant']);
@@ -1144,10 +1150,56 @@ service cloud.firestore {
           && hasAnyRole(organizationId, ['owner', 'accountant', 'assistant'])
           && isValidPayment(incoming(), organizationId, paymentId)
           && incoming().status != 'voided'
+          && !('voidReason' in incoming())
+          && !('voidedBy' in incoming())
+          && !('voidedAt' in incoming())
           && (!('adjustedCreditPiasters' in incoming()) || incoming().adjustedCreditPiasters == 0)
           && (!('adjustedDebitPiasters' in incoming()) || incoming().adjustedDebitPiasters == 0)
           && !('lastAdjustmentEntryId' in incoming())
-          && exists(/databases/$(database)/documents/organizations/$(organizationId)/students/$(incoming().studentId))
+          && hasStudentDoc(organizationId, incoming().studentId)
+          && getStudentBefore(organizationId, incoming().studentId).organizationId == organizationId
+          && getStudentBefore(organizationId, incoming().studentId).status == 'active'
+          && (
+            !('groupId' in incoming())
+            || incoming().groupId == ''
+            || (
+              hasGroupDoc(organizationId, incoming().groupId)
+              && getGroupBefore(organizationId, incoming().groupId).organizationId == organizationId
+              && hasEnrollmentDoc(organizationId, incoming().groupId + '_' + incoming().studentId)
+              && getEnrollmentBefore(organizationId, incoming().groupId + '_' + incoming().studentId).organizationId == organizationId
+              && getEnrollmentBefore(organizationId, incoming().groupId + '_' + incoming().studentId).status == 'active'
+            )
+          )
+          && hasLedgerDocAfter(organizationId, paymentId + '_charge')
+          && getLedgerAfter(organizationId, paymentId + '_charge').organizationId == organizationId
+          && getLedgerAfter(organizationId, paymentId + '_charge').entityType == 'payment'
+          && getLedgerAfter(organizationId, paymentId + '_charge').entityId == paymentId
+          && getLedgerAfter(organizationId, paymentId + '_charge').entryType == 'charge'
+          && getLedgerAfter(organizationId, paymentId + '_charge').direction == 'debit'
+          && getLedgerAfter(organizationId, paymentId + '_charge').amountPiasters == incoming().amountPiasters
+          && getLedgerAfter(organizationId, paymentId + '_charge').createdAt == request.time
+          && (
+            incoming().paidAmountPiasters == 0
+            || (
+              hasLedgerDocAfter(organizationId, paymentId + '_pay_init')
+              && getLedgerAfter(organizationId, paymentId + '_pay_init').organizationId == organizationId
+              && getLedgerAfter(organizationId, paymentId + '_pay_init').entityType == 'payment'
+              && getLedgerAfter(organizationId, paymentId + '_pay_init').entityId == paymentId
+              && getLedgerAfter(organizationId, paymentId + '_pay_init').entryType == 'payment'
+              && getLedgerAfter(organizationId, paymentId + '_pay_init').direction == 'credit'
+              && getLedgerAfter(organizationId, paymentId + '_pay_init').amountPiasters == incoming().paidAmountPiasters
+              && getLedgerAfter(organizationId, paymentId + '_pay_init').createdAt == request.time
+            )
+          )
+          && (
+            !('idempotencyKey' in incoming())
+            || (
+              !exists(/databases/$(database)/documents/organizations/$(organizationId)/idempotencyKeys/$(('pay_' + incoming().idempotencyKey)))
+              && existsAfter(/databases/$(database)/documents/organizations/$(organizationId)/idempotencyKeys/$(('pay_' + incoming().idempotencyKey)))
+              && getAfter(/databases/$(database)/documents/organizations/$(organizationId)/idempotencyKeys/$(('pay_' + incoming().idempotencyKey))).data.entityType == 'payment'
+              && getAfter(/databases/$(database)/documents/organizations/$(organizationId)/idempotencyKeys/$(('pay_' + incoming().idempotencyKey))).data.entityId == paymentId
+            )
+          )
           && incoming().recordedBy == request.auth.uid
           && incoming().createdAt == request.time
           && incoming().updatedAt == request.time;
@@ -1179,6 +1231,20 @@ service cloud.firestore {
                 'amountPiasters', 'paidAmount', 'dueAmount', 'paidAmountPiasters', 'dueAmountPiasters',
                 'status', 'method', 'referenceNumber', 'updatedAt'
               ])
+              && hasLedgerDocAfter(organizationId, paymentId + '_pay_' + string(incoming().paidAmountPiasters))
+              && getLedgerAfter(organizationId, paymentId + '_pay_' + string(incoming().paidAmountPiasters)).organizationId == organizationId
+              && getLedgerAfter(organizationId, paymentId + '_pay_' + string(incoming().paidAmountPiasters)).entityType == 'payment'
+              && getLedgerAfter(organizationId, paymentId + '_pay_' + string(incoming().paidAmountPiasters)).entityId == paymentId
+              && getLedgerAfter(organizationId, paymentId + '_pay_' + string(incoming().paidAmountPiasters)).entryType == 'payment'
+              && getLedgerAfter(organizationId, paymentId + '_pay_' + string(incoming().paidAmountPiasters)).direction == 'credit'
+              && getLedgerAfter(organizationId, paymentId + '_pay_' + string(incoming().paidAmountPiasters)).createdAt == request.time
+              && (
+                ('paidAmountPiasters' in existing()
+                  && getLedgerAfter(organizationId, paymentId + '_pay_' + string(incoming().paidAmountPiasters)).amountPiasters == (incoming().paidAmountPiasters - existing().paidAmountPiasters))
+                ||
+                (!('paidAmountPiasters' in existing())
+                  && math.abs(((existing().paidAmount * 100) + getLedgerAfter(organizationId, paymentId + '_pay_' + string(incoming().paidAmountPiasters)).amountPiasters) - incoming().paidAmountPiasters) < 0.5)
+              )
             )
             ||
             (
@@ -1194,6 +1260,27 @@ service cloud.firestore {
                 'amountPiasters', 'paidAmountPiasters', 'dueAmountPiasters',
                 'status', 'voidReason', 'voidedBy', 'voidedAt', 'updatedAt'
               ])
+              && hasLedgerDocAfter(organizationId, paymentId + '_rev_charge')
+              && getLedgerAfter(organizationId, paymentId + '_rev_charge').organizationId == organizationId
+              && getLedgerAfter(organizationId, paymentId + '_rev_charge').entityType == 'payment'
+              && getLedgerAfter(organizationId, paymentId + '_rev_charge').entityId == paymentId
+              && getLedgerAfter(organizationId, paymentId + '_rev_charge').entryType == 'reversal'
+              && getLedgerAfter(organizationId, paymentId + '_rev_charge').direction == 'credit'
+              && getLedgerAfter(organizationId, paymentId + '_rev_charge').amountPiasters == incoming().amountPiasters
+              && getLedgerAfter(organizationId, paymentId + '_rev_charge').createdAt == request.time
+              && (
+                incoming().paidAmountPiasters == 0
+                || (
+                  hasLedgerDocAfter(organizationId, paymentId + '_rev_paid')
+                  && getLedgerAfter(organizationId, paymentId + '_rev_paid').organizationId == organizationId
+                  && getLedgerAfter(organizationId, paymentId + '_rev_paid').entityType == 'payment'
+                  && getLedgerAfter(organizationId, paymentId + '_rev_paid').entityId == paymentId
+                  && getLedgerAfter(organizationId, paymentId + '_rev_paid').entryType == 'reversal'
+                  && getLedgerAfter(organizationId, paymentId + '_rev_paid').direction == 'debit'
+                  && getLedgerAfter(organizationId, paymentId + '_rev_paid').amountPiasters == incoming().paidAmountPiasters
+                  && getLedgerAfter(organizationId, paymentId + '_rev_paid').createdAt == request.time
+                )
+              )
             )
             ||
             (
@@ -1219,7 +1306,7 @@ service cloud.firestore {
       }
 
       // -----------------------------------------------------------------------
-      // Expenses (Immutable once posted; only voided transition permitted)
+      // Expenses (Immutable once posted; two-way atomic coupling to ledgerEntries)
       // -----------------------------------------------------------------------
       match /expenses/{expenseId} {
         allow get: if isValidId(organizationId) && isValidId(expenseId) && hasAnyRole(organizationId, ['owner', 'accountant']);
@@ -1230,6 +1317,26 @@ service cloud.firestore {
           && hasAnyRole(organizationId, ['owner', 'accountant'])
           && isValidExpense(incoming(), organizationId, expenseId)
           && incoming().status == 'posted'
+          && !('voidReason' in incoming())
+          && !('voidedBy' in incoming())
+          && !('voidedAt' in incoming())
+          && hasLedgerDocAfter(organizationId, expenseId + '_charge')
+          && getLedgerAfter(organizationId, expenseId + '_charge').organizationId == organizationId
+          && getLedgerAfter(organizationId, expenseId + '_charge').entityType == 'expense'
+          && getLedgerAfter(organizationId, expenseId + '_charge').entityId == expenseId
+          && getLedgerAfter(organizationId, expenseId + '_charge').entryType == 'charge'
+          && getLedgerAfter(organizationId, expenseId + '_charge').direction == 'debit'
+          && getLedgerAfter(organizationId, expenseId + '_charge').amountPiasters == incoming().amountPiasters
+          && getLedgerAfter(organizationId, expenseId + '_charge').createdAt == request.time
+          && (
+            !('idempotencyKey' in incoming())
+            || (
+              !exists(/databases/$(database)/documents/organizations/$(organizationId)/idempotencyKeys/$(('exp_' + incoming().idempotencyKey)))
+              && existsAfter(/databases/$(database)/documents/organizations/$(organizationId)/idempotencyKeys/$(('exp_' + incoming().idempotencyKey)))
+              && getAfter(/databases/$(database)/documents/organizations/$(organizationId)/idempotencyKeys/$(('exp_' + incoming().idempotencyKey))).data.entityType == 'expense'
+              && getAfter(/databases/$(database)/documents/organizations/$(organizationId)/idempotencyKeys/$(('exp_' + incoming().idempotencyKey))).data.entityId == expenseId
+            )
+          )
           && incoming().recordedBy == request.auth.uid
           && incoming().createdAt == request.time
           && incoming().updatedAt == request.time;
@@ -1250,7 +1357,15 @@ service cloud.firestore {
           && incoming().updatedAt == request.time
           && incoming().diff(existing()).affectedKeys().hasOnly([
             'amountPiasters', 'status', 'voidReason', 'voidedBy', 'voidedAt', 'updatedAt'
-          ]);
+          ])
+          && hasLedgerDocAfter(organizationId, expenseId + '_rev_charge')
+          && getLedgerAfter(organizationId, expenseId + '_rev_charge').organizationId == organizationId
+          && getLedgerAfter(organizationId, expenseId + '_rev_charge').entityType == 'expense'
+          && getLedgerAfter(organizationId, expenseId + '_rev_charge').entityId == expenseId
+          && getLedgerAfter(organizationId, expenseId + '_rev_charge').entryType == 'reversal'
+          && getLedgerAfter(organizationId, expenseId + '_rev_charge').direction == 'credit'
+          && getLedgerAfter(organizationId, expenseId + '_rev_charge').amountPiasters == incoming().amountPiasters
+          && getLedgerAfter(organizationId, expenseId + '_rev_charge').createdAt == request.time;
 
         allow delete: if false;
       }
@@ -1301,17 +1416,20 @@ service cloud.firestore {
           && (
             (
               incoming().entityType == 'payment'
+              && keyId.matches('^pay_.+')
               && existsAfter(/databases/$(database)/documents/organizations/$(organizationId)/payments/$(incoming().entityId))
             )
             ||
             (
               incoming().entityType == 'expense'
+              && keyId.matches('^exp_.+')
               && hasAnyRole(organizationId, ['owner', 'accountant'])
               && existsAfter(/databases/$(database)/documents/organizations/$(organizationId)/expenses/$(incoming().entityId))
             )
             ||
             (
               incoming().entityType == 'ledger_entry'
+              && keyId.matches('^adj_.+')
               && hasAnyRole(organizationId, ['owner', 'accountant'])
               && existsAfter(/databases/$(database)/documents/organizations/$(organizationId)/ledgerEntries/$(incoming().entityId))
             )

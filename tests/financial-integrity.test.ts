@@ -8,6 +8,9 @@ import {
   computePaymentBreakdown,
   DomainValidationError,
   egpToPiasters,
+  MAX_SAFE_AMOUNT_PIASTERS,
+  resolveValidatedExpensePiasters,
+  resolveValidatedPaymentPiasters,
 } from '../src/lib/domain/money';
 import {
   deriveFinancialSummaryFromLedger,
@@ -15,7 +18,7 @@ import {
   validateAdjustmentAgainstPayment,
   validateSettlementAgainstPayment,
 } from '../src/lib/domain/ledger';
-import type { LedgerEntry, MemberRole, PaymentRecord } from '../src/types/domain';
+import type { ExpenseRecord, LedgerEntry, MemberRole, PaymentRecord } from '../src/types/domain';
 
 function createInMemoryStore(initialDocs: Record<string, Record<string, unknown>> = {}): {
   store: TemaDataStore;
@@ -663,6 +666,370 @@ describe('TEMA Financial Integrity — Unit & Express API Tests', () => {
         | { adjustedCreditPiasters?: number }
         | undefined;
       expect(storedPayment?.adjustedCreditPiasters).toBe(50000);
+    });
+  });
+
+  it('7. legacy payment/expense handling rejects corrupted/mismatched records and safely resolves missing *Piasters without migration', () => {
+    // Legacy Payment without *Piasters fields resolves cleanly and flags backfill
+    const legacyPayment: PaymentRecord = {
+      id: 'pay_legacy_1',
+      organizationId: 'org_1',
+      studentId: 'stu_1',
+      studentName: 'طالب قديم',
+      amount: 350.5,
+      paidAmount: 100.25,
+      dueAmount: 250.25,
+      currency: 'EGP',
+      category: 'tuition',
+      method: 'cash',
+      status: 'partial',
+      recordedBy: 'uid_1',
+      createdAt: null,
+      updatedAt: null,
+    };
+    const resolvedLegacy = resolveValidatedPaymentPiasters(legacyPayment);
+    expect(resolvedLegacy.amountPiasters).toBe(35050);
+    expect(resolvedLegacy.paidAmountPiasters).toBe(10025);
+    expect(resolvedLegacy.dueAmountPiasters).toBe(25025);
+    expect(resolvedLegacy.needsBackfill).toEqual({
+      amountPiasters: true,
+      paidAmountPiasters: true,
+      dueAmountPiasters: true,
+    });
+
+    // Settling legacy payment succeeds and requests amountPiasters backfill
+    const settleLegacy = validateSettlementAgainstPayment(legacyPayment, 250.25, 'instapay');
+    expect(settleLegacy.needsAmountBackfill).toBe(true);
+    expect(settleLegacy.totalPiasters).toBe(35050);
+    expect(settleLegacy.newPaidPiasters).toBe(35050);
+    expect(settleLegacy.nextStatus).toBe('posted');
+
+    // Tampered record with mismatched amount <-> amountPiasters is REJECTED (not bypassed via defaults)
+    expect(() =>
+      resolveValidatedPaymentPiasters({
+        ...legacyPayment,
+        amountPiasters: 100, // tampered! should be 35050
+      })
+    ).toThrow(DomainValidationError);
+
+    // Corrupted legacy record with zero or negative amount or >MAX_SAFE_AMOUNT_PIASTERS is REJECTED
+    expect(() =>
+      resolveValidatedPaymentPiasters({
+        ...legacyPayment,
+        amount: 0,
+        paidAmount: 0,
+        dueAmount: 0,
+      })
+    ).toThrow(DomainValidationError);
+    expect(() => egpToPiasters(MAX_SAFE_AMOUNT_PIASTERS / 100 + 1)).toThrow(DomainValidationError);
+
+    // Legacy Expense without amountPiasters resolves cleanly; mismatched throws
+    const legacyExpense: ExpenseRecord = {
+      id: 'exp_legacy_1',
+      organizationId: 'org_1',
+      title: 'صيانة',
+      category: 'other',
+      amount: 199.95,
+      currency: 'EGP',
+      status: 'posted',
+      expenseDate: '2026-10-01',
+      recordedBy: 'uid_1',
+      createdAt: null,
+      updatedAt: null,
+    };
+    expect(resolveValidatedExpensePiasters(legacyExpense)).toEqual({
+      amountPiasters: 19995,
+      needsBackfill: true,
+    });
+    expect(() =>
+      resolveValidatedExpensePiasters({ ...legacyExpense, amountPiasters: 500 })
+    ).toThrow(DomainValidationError);
+
+    // Hybrid ledger + legacy summary never double counts covered records and reads uncovered legacy ones safely
+    const hybrid = deriveFinancialSummaryFromLedger([], [legacyPayment], [legacyExpense]);
+    expect(hybrid.source).toBe('hybrid');
+    expect(hybrid.chargedEgp).toBe(350.5);
+    expect(hybrid.collectedEgp).toBe(100.25);
+    expect(hybrid.outstandingEgp).toBe(250.25);
+    expect(hybrid.expensesEgp).toBe(199.95);
+    expect(hybrid.netEgp).toBe(-99.7);
+  });
+
+  it('8. Step D API hardening: blocks archived/inactive students, unenrolled groups, enforces expense void RBAC, and deduplicates concurrent races', async () => {
+    const docs = new Map<string, Record<string, unknown>>(
+      Object.entries({
+        'organizations/org_1': {
+          id: 'org_1',
+          name: 'سنتر المستقبل',
+          currency: 'EGP',
+          status: 'active',
+        },
+        'organizations/org_1/students/stu_active': {
+          id: 'stu_active',
+          organizationId: 'org_1',
+          fullName: 'سيف محمود',
+          status: 'active',
+        },
+        'organizations/org_1/students/stu_archived': {
+          id: 'stu_archived',
+          organizationId: 'org_1',
+          fullName: 'طالب مؤرشف',
+          status: 'archived',
+        },
+        'organizations/org_1/students/stu_inactive': {
+          id: 'stu_inactive',
+          organizationId: 'org_1',
+          fullName: 'طالب موقوف',
+          status: 'inactive',
+        },
+        'organizations/org_1/groups/grp_1': {
+          id: 'grp_1',
+          organizationId: 'org_1',
+          name: 'فيزياء 3ث',
+          status: 'active',
+        },
+      })
+    );
+
+    // Atomic store enforcing exists:false precondition on set writes (simulating Firestore :commit)
+    const atomicStore: TemaDataStore = {
+      async getDoc<T>(docPath: string): Promise<T | null> {
+        const found = docs.get(docPath);
+        return found ? (structuredClone(found) as T) : null;
+      },
+      async listCollection<T>(collectionPath: string): Promise<T[]> {
+        const prefix = `${collectionPath}/`;
+        const out: T[] = [];
+        for (const [k, v] of docs.entries()) {
+          if (k.startsWith(prefix) && !k.slice(prefix.length).includes('/')) {
+            out.push(structuredClone(v) as T);
+          }
+        }
+        return out;
+      },
+      async commitWrites(writes: RestWriteInstruction[]): Promise<void> {
+        for (const w of writes) {
+          if (w.type === 'set' && docs.has(w.path)) {
+            throw new Error('FIRESTORE_COMMIT_ERROR_409 ALREADY_EXISTS');
+          }
+          if (w.type === 'update' && !docs.has(w.path)) {
+            throw new Error('FIRESTORE_COMMIT_ERROR_404 NOT_FOUND');
+          }
+        }
+        for (const w of writes) {
+          const clean: Record<string, unknown> = {};
+          for (const [k, v] of Object.entries(w.data)) {
+            clean[k] = v === SERVER_TIMESTAMP_SENTINEL ? '2026-11-17T12:00:00.000Z' : v;
+          }
+          if (w.type === 'set') {
+            docs.set(w.path, clean);
+          } else {
+            docs.set(w.path, { ...(docs.get(w.path) ?? {}), ...clean });
+          }
+        }
+      },
+    };
+
+    const roleByToken: Record<string, { uid: string; role: MemberRole }> = {
+      tok_assistant: { uid: 'uid_assistant', role: 'assistant' },
+      tok_accountant: { uid: 'uid_accountant', role: 'accountant' },
+    };
+
+    const app = createApiApp({
+      temaApiDeps: {
+        store: atomicStore,
+        verifyToken: async (authHeader) => {
+          const tok = authHeader?.replace('Bearer ', '') ?? '';
+          const entry = roleByToken[tok];
+          if (!entry) return { ok: false, status: 401, error: 'Unauthorized' };
+          return {
+            ok: true,
+            idToken: tok,
+            user: { uid: entry.uid, email: `${entry.role}@tema.edu.eg`, emailVerified: true },
+          };
+        },
+        verifyMembership: async (orgId, uid, idToken) => {
+          const entry = roleByToken[idToken];
+          if (!entry || entry.uid !== uid || orgId !== 'org_1') {
+            return { ok: false, status: 403, error: 'Membership denied' };
+          }
+          return {
+            ok: true,
+            membership: {
+              uid,
+              organizationId: orgId,
+              displayName: entry.role,
+              role: entry.role,
+              status: 'active',
+            },
+          };
+        },
+      },
+    });
+
+    await withServer(app, async (baseUrl) => {
+      // 1. Archived student rejected (409 STUDENT_ARCHIVED)
+      const archivedRes = await fetch(`${baseUrl}/api/v1/organizations/org_1/payments`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_assistant' },
+        body: JSON.stringify({
+          studentId: 'stu_archived',
+          studentName: 'طالب مؤرشف',
+          amount: 300,
+          paidAmount: 300,
+          category: 'tuition',
+          method: 'cash',
+        }),
+      });
+      expect(archivedRes.status).toBe(409);
+
+      // 2. Inactive student rejected (409 STUDENT_INACTIVE)
+      const inactiveRes = await fetch(`${baseUrl}/api/v1/organizations/org_1/payments`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_assistant' },
+        body: JSON.stringify({
+          studentId: 'stu_inactive',
+          studentName: 'طالب موقوف',
+          amount: 300,
+          paidAmount: 300,
+          category: 'tuition',
+          method: 'cash',
+        }),
+      });
+      expect(inactiveRes.status).toBe(409);
+
+      // 3. Payment referencing group where student is NOT enrolled rejected (409)
+      const unenrolledGroupRes = await fetch(`${baseUrl}/api/v1/organizations/org_1/payments`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_assistant' },
+        body: JSON.stringify({
+          studentId: 'stu_active',
+          studentName: 'سيف محمود',
+          groupId: 'grp_1',
+          amount: 300,
+          paidAmount: 300,
+          category: 'tuition',
+          method: 'cash',
+        }),
+      });
+      expect(unenrolledGroupRes.status).toBe(409);
+
+      // 4. Zero / negative / >2-decimal payment amounts rejected (400)
+      for (const badAmount of [0, -100, 99.129]) {
+        const badRes = await fetch(`${baseUrl}/api/v1/organizations/org_1/payments`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_assistant' },
+          body: JSON.stringify({
+            studentId: 'stu_active',
+            studentName: 'سيف محمود',
+            amount: badAmount,
+            paidAmount: 0,
+            category: 'tuition',
+            method: 'cash',
+          }),
+        });
+        expect(badRes.status).toBe(400);
+      }
+
+      // 5. Concurrent parallel duplicate payment submissions with same idempotencyKey commit ONCE
+      const payPayload = JSON.stringify({
+        studentId: 'stu_active',
+        studentName: 'سيف محمود',
+        amount: 400,
+        paidAmount: 150,
+        category: 'tuition',
+        method: 'cash',
+        idempotencyKey: 'race_pay_1',
+      });
+      const [p1, p2, p3] = await Promise.all([
+        fetch(`${baseUrl}/api/v1/organizations/org_1/payments`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_assistant' },
+          body: payPayload,
+        }),
+        fetch(`${baseUrl}/api/v1/organizations/org_1/payments`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_assistant' },
+          body: payPayload,
+        }),
+        fetch(`${baseUrl}/api/v1/organizations/org_1/payments`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_assistant' },
+          body: payPayload,
+        }),
+      ]);
+      const pStatuses = [p1.status, p2.status, p3.status].sort();
+      expect(pStatuses).toEqual([200, 200, 201]);
+      const pBodies = await Promise.all([p1.json(), p2.json(), p3.json()]) as Array<{ paymentId: string }>;
+      expect(new Set(pBodies.map((b) => b.paymentId)).size).toBe(1);
+
+      // 6. Concurrent parallel duplicate expense submissions with same idempotencyKey commit ONCE
+      const expPayload = JSON.stringify({
+        title: 'كهرباء السنتر',
+        category: 'utilities',
+        amount: 600,
+        expenseDate: '2026-11-17',
+        idempotencyKey: 'race_exp_1',
+      });
+      const [e1, e2] = await Promise.all([
+        fetch(`${baseUrl}/api/v1/organizations/org_1/expenses`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_accountant' },
+          body: expPayload,
+        }),
+        fetch(`${baseUrl}/api/v1/organizations/org_1/expenses`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_accountant' },
+          body: expPayload,
+        }),
+      ]);
+      expect([e1.status, e2.status].sort()).toEqual([200, 201]);
+      const eBodies = await Promise.all([e1.json(), e2.json()]) as Array<{ expenseId: string }>;
+      expect(eBodies[0].expenseId).toBe(eBodies[1].expenseId);
+      const expenseId = eBodies[0].expenseId;
+
+      // 7. Assistant CANNOT void an expense (403); Accountant CAN void ONCE (200), double-void blocked (409)
+      const assVoidExp = await fetch(
+        `${baseUrl}/api/v1/organizations/org_1/expenses/${expenseId}/void`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_assistant' },
+          body: JSON.stringify({ reason: 'محاولة غير مصرح بها' }),
+        }
+      );
+      expect(assVoidExp.status).toBe(403);
+
+      const accVoidExp = await fetch(
+        `${baseUrl}/api/v1/organizations/org_1/expenses/${expenseId}/void`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_accountant' },
+          body: JSON.stringify({ reason: 'فاتورة مكررة' }),
+        }
+      );
+      expect(accVoidExp.status).toBe(200);
+      expect(docs.has(`organizations/org_1/ledgerEntries/${expenseId}_rev_charge`)).toBe(true);
+
+      const doubleVoidExp = await fetch(
+        `${baseUrl}/api/v1/organizations/org_1/expenses/${expenseId}/void`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_accountant' },
+          body: JSON.stringify({ reason: 'محاولة إلغاء ثانية' }),
+        }
+      );
+      expect(doubleVoidExp.status).toBe(409);
+
+      // Summary: voided expense nets to 0, payment still shows 400 charged / 150 collected / 250 due
+      const finalLedger = await atomicStore.listCollection<LedgerEntry>(
+        'organizations/org_1/ledgerEntries',
+        'tok_accountant'
+      );
+      const summary = deriveFinancialSummaryFromLedger(finalLedger, [], []);
+      expect(summary.chargedEgp).toBe(400);
+      expect(summary.collectedEgp).toBe(150);
+      expect(summary.outstandingEgp).toBe(250);
+      expect(summary.expensesEgp).toBe(0);
     });
   });
 });

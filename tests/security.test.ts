@@ -660,4 +660,39 @@ describe('TEMA Gemini Backend Security Controls', () => {
     expect(temaRoutes).toContain("'/organizations/:orgId/payments/:paymentId/adjust'");
     expect(temaRoutes).toContain('validateAdjustmentAgainstPayment(');
   });
+
+  it('13. Step D financial integrity enforces amount/piasters parity, active student restriction, two-way ledger coupling, and legacy validation', () => {
+    const rules = fs.readFileSync(path.resolve(process.cwd(), 'firestore.rules'), 'utf8');
+    const money = fs.readFileSync(path.resolve(process.cwd(), 'src/lib/domain/money.ts'), 'utf8');
+    const financeService = fs.readFileSync(
+      path.resolve(process.cwd(), 'src/services/financeService.ts'),
+      'utf8'
+    );
+    const firestoreRest = fs.readFileSync(
+      path.resolve(process.cwd(), 'server/api/firestoreRest.ts'),
+      'utf8'
+    );
+    const temaRoutes = fs.readFileSync(
+      path.resolve(process.cwd(), 'server/api/temaRoutes.ts'),
+      'utf8'
+    );
+
+    // Rules: EGP<->piasters parity on payments and expenses, active student, two-way ledger & idempotency checks
+    expect(rules).toContain('math.abs((data.paidAmount * 100) - data.paidAmountPiasters) < 0.001');
+    expect(rules).toContain('math.abs((data.dueAmount * 100) - data.dueAmountPiasters) < 0.001');
+    expect(rules).toContain("getStudentBefore(organizationId, incoming().studentId).status == 'active'");
+    expect(rules).toContain("hasLedgerDocAfter(organizationId, paymentId + '_charge')");
+    expect(rules).toContain("hasLedgerDocAfter(organizationId, expenseId + '_charge')");
+    expect(rules).toContain("hasLedgerDocAfter(organizationId, expenseId + '_rev_charge')");
+    expect(rules).toContain("keyId.matches('^pay_.+')");
+    expect(rules).toContain("keyId.matches('^exp_.+')");
+
+    // Domain, services, and Express REST API: active student, strict legacy validators, atomic set preconditions
+    expect(money).toContain('export function resolveValidatedPaymentPiasters(');
+    expect(money).toContain('export function resolveValidatedExpensePiasters(');
+    expect(financeService).toContain("if (student.status !== 'active')");
+    expect(temaRoutes).toContain("if (student.status !== 'active')");
+    expect(temaRoutes).toContain("'/organizations/:orgId/expenses/:expenseId/void'");
+    expect(firestoreRest).toContain('currentDocument = { exists: false }');
+  });
 });

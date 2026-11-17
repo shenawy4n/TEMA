@@ -13,9 +13,9 @@ import { isValidEntityId, sanitizeText } from '@/src/lib/firebase/validation';
 import { generateId, getTodayIsoDate } from '@/src/lib/utils/format';
 import {
   DomainValidationError,
-  egpToPiasters,
   piastersToEgp,
-  resolveRecordPiasters,
+  resolveValidatedExpensePiasters,
+  resolveValidatedPaymentPiasters,
 } from '@/src/lib/domain/money';
 import {
   validateAdjustmentAgainstPayment,
@@ -160,8 +160,17 @@ export async function createPayment(
         throw new DomainValidationError('الطالب المحدد غير موجود في المنظمة.', 'STUDENT_NOT_FOUND', 404);
       }
       const student = studentSnap.data() as Student;
-      if (student.status === 'archived') {
-        throw new DomainValidationError('لا يمكن إنشاء فاتورة جديدة لطالب مؤرشف.', 'STUDENT_ARCHIVED', 409);
+      if (student.organizationId !== organizationId) {
+        throw new DomainValidationError('الطالب المحدد لا ينتمي لهذه المنظمة.', 'TENANT_MISMATCH', 403);
+      }
+      if (student.status !== 'active') {
+        throw new DomainValidationError(
+          student.status === 'archived'
+            ? 'لا يمكن إنشاء فاتورة جديدة لطالب مؤرشف.'
+            : 'لا يمكن إنشاء فاتورة جديدة لطالب غير نشط.',
+          student.status === 'archived' ? 'STUDENT_ARCHIVED' : 'STUDENT_INACTIVE',
+          409
+        );
       }
 
       if (validated.groupId) {
@@ -323,9 +332,11 @@ export async function settlePaymentInstallment(
       }
 
       const existing = paySnap.data() as PaymentRecord;
+      if (existing.organizationId !== organizationId) {
+        throw new DomainValidationError('القيد المالي لا يتبع هذه المنظمة.', 'TENANT_MISMATCH', 403);
+      }
       const settlement = validateSettlementAgainstPayment(existing, installmentAmountEgp, method);
 
-      const totalPiasters = resolveRecordPiasters(existing.amountPiasters, existing.amount);
       const settleUpdate: Record<string, unknown> = {
         paidAmount: settlement.newPaidAmount,
         dueAmount: settlement.newDueAmount,
@@ -336,8 +347,8 @@ export async function settlePaymentInstallment(
         referenceNumber: sanitizeText(referenceNumber || existing.referenceNumber || '', 80),
         updatedAt: serverTimestamp(),
       };
-      if (typeof existing.amountPiasters !== 'number') {
-        settleUpdate.amountPiasters = totalPiasters;
+      if (settlement.needsAmountBackfill) {
+        settleUpdate.amountPiasters = settlement.totalPiasters;
       }
 
       tx.update(payRef, settleUpdate);
@@ -412,10 +423,6 @@ export async function createPaymentAdjustment(
   }
 
   const effectiveKey = idempotencyKey && idempotencyKey.length > 0 ? idempotencyKey : generateId('adj');
-  const amountPiastersPrecheck = egpToPiasters(adjustmentAmountEgp, {
-    allowZero: false,
-    fieldLabel: 'قيمة التسوية',
-  });
   const entryId = `ldg_adj_${effectiveKey}`;
   const keyDocId = `adj_${effectiveKey}`;
   const path = `organizations/${organizationId}/ledgerEntries/${entryId}`;
@@ -442,6 +449,9 @@ export async function createPaymentAdjustment(
         throw new DomainValidationError('القيد المالي غير موجود.', 'PAYMENT_NOT_FOUND', 404);
       }
       const payment = paySnap.data() as PaymentRecord;
+      if (payment.organizationId !== organizationId) {
+        throw new DomainValidationError('القيد المالي لا يتبع هذه المنظمة.', 'TENANT_MISMATCH', 403);
+      }
       const validatedAdj = validateAdjustmentAgainstPayment(
         payment,
         adjustmentAmountEgp,
@@ -474,7 +484,7 @@ export async function createPaymentAdjustment(
         studentId: payment.studentId,
         studentName: payment.studentName,
         groupId: payment.groupId || '',
-        amountPiasters: amountPiastersPrecheck,
+        amountPiasters: validatedAdj.amountPiasters,
         amount: validatedAdj.amount,
         currency: 'EGP',
         idempotencyKey: effectiveKey,
@@ -548,13 +558,17 @@ export async function voidPayment(
         throw new DomainValidationError('القيد المالي غير موجود.', 'PAYMENT_NOT_FOUND', 404);
       }
       const existing = paySnap.data() as PaymentRecord;
+      if (existing.organizationId !== organizationId) {
+        throw new DomainValidationError('القيد المالي لا يتبع هذه المنظمة.', 'TENANT_MISMATCH', 403);
+      }
       if (existing.status === 'voided') {
         throw new DomainValidationError('هذا القيد المالي ملغى بالفعل.', 'ALREADY_VOIDED', 409);
       }
 
-      const totalPiasters = resolveRecordPiasters(existing.amountPiasters, existing.amount);
-      const paidPiasters = resolveRecordPiasters(existing.paidAmountPiasters, existing.paidAmount);
-      const duePiasters = Math.max(0, totalPiasters - paidPiasters);
+      const resolved = resolveValidatedPaymentPiasters(existing);
+      const totalPiasters = resolved.amountPiasters;
+      const paidPiasters = resolved.paidAmountPiasters;
+      const duePiasters = resolved.dueAmountPiasters;
 
       // Keep original amount/paidAmount/dueAmount intact; mark status='voided' and record formal reversal ledger entries
       const voidPayUpdate: Record<string, unknown> = {
@@ -564,9 +578,13 @@ export async function voidPayment(
         voidedAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       };
-      if (typeof existing.amountPiasters !== 'number') {
+      if (resolved.needsBackfill.amountPiasters) {
         voidPayUpdate.amountPiasters = totalPiasters;
+      }
+      if (resolved.needsBackfill.paidAmountPiasters) {
         voidPayUpdate.paidAmountPiasters = paidPiasters;
+      }
+      if (resolved.needsBackfill.dueAmountPiasters) {
         voidPayUpdate.dueAmountPiasters = duePiasters;
       }
       tx.update(payRef, voidPayUpdate);
@@ -769,11 +787,15 @@ export async function voidExpense(
       }
 
       const existing = expSnap.data() as ExpenseRecord;
+      if (existing.organizationId !== organizationId) {
+        throw new DomainValidationError('قيد المصروف لا يتبع هذه المنظمة.', 'TENANT_MISMATCH', 403);
+      }
       if (existing.status === 'voided') {
         throw new DomainValidationError('هذا المصروف ملغى بالفعل.', 'ALREADY_VOIDED', 409);
       }
 
-      const amountPiasters = resolveRecordPiasters(existing.amountPiasters, existing.amount);
+      const resolved = resolveValidatedExpensePiasters(existing);
+      const amountPiasters = resolved.amountPiasters;
 
       const voidExpUpdate: Record<string, unknown> = {
         status: 'voided',
@@ -782,7 +804,7 @@ export async function voidExpense(
         voidedAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       };
-      if (typeof existing.amountPiasters !== 'number') {
+      if (resolved.needsBackfill) {
         voidExpUpdate.amountPiasters = amountPiasters;
       }
       tx.update(expRef, voidExpUpdate);

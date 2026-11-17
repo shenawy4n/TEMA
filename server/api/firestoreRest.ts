@@ -141,6 +141,8 @@ export async function restCommitWrites(
     if (w.type === 'update') {
       writeObj.updateMask = { fieldPaths: updateMaskPaths };
       writeObj.currentDocument = { exists: true };
+    } else {
+      writeObj.currentDocument = { exists: false };
     }
 
     return writeObj;

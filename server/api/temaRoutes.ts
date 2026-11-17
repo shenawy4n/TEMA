@@ -2,6 +2,7 @@ import express, { type Request, type Response, type Router } from 'express';
 import crypto from 'node:crypto';
 import type {
   ExpenseCategory,
+  ExpenseRecord,
   GroupEnrollment,
   LedgerEntry,
   Organization,
@@ -15,7 +16,8 @@ import type {
 import {
   DomainValidationError,
   piastersToEgp,
-  resolveRecordPiasters,
+  resolveValidatedExpensePiasters,
+  resolveValidatedPaymentPiasters,
 } from '../../src/lib/domain/money';
 import { assertPermission, sanitizeAuditMetadata, type TemaPermission } from '../../src/lib/domain/rbac';
 import { getApps, initializeApp } from 'firebase-admin/app';
@@ -218,6 +220,10 @@ function sendErrorResponse(res: Response, err: unknown, correlationId: string): 
     return;
   }
   const msg = err instanceof Error ? err.message : '';
+  if (msg.includes('FIRESTORE_COMMIT_ERROR_409') || msg.includes('ALREADY_EXISTS')) {
+    res.status(409).json({ error: 'Concurrent write conflict or duplicate operation.', correlationId });
+    return;
+  }
   if (msg.includes('FIRESTORE_REST_ERROR_403') || msg.includes('FIRESTORE_COMMIT_ERROR_403')) {
     res.status(403).json({ error: 'Firestore denied the operation.', correlationId });
     return;
@@ -275,15 +281,30 @@ export function createTemaApiRouter(deps: TemaApiDeps): Router {
       if (!student || student.organizationId !== ctx.orgId) {
         throw new DomainValidationError('الطالب غير موجود في المنظمة.', 'STUDENT_NOT_FOUND', 404);
       }
-      if (student.status === 'archived') {
-        throw new DomainValidationError('لا يمكن تسجيل فاتورة لطالب مؤرشف.', 'STUDENT_ARCHIVED', 409);
+      if (student.status !== 'active') {
+        throw new DomainValidationError(
+          student.status === 'archived'
+            ? 'لا يمكن تسجيل فاتورة لطالب مؤرشف.'
+            : 'لا يمكن تسجيل فاتورة لطالب غير نشط.',
+          student.status === 'archived' ? 'STUDENT_ARCHIVED' : 'STUDENT_INACTIVE',
+          409
+        );
       }
 
       if (validated.groupId) {
-        const enrollment = await deps.store.getDoc<GroupEnrollment>(
-          `organizations/${ctx.orgId}/enrollments/${validated.groupId}_${validated.studentId}`,
-          ctx.idToken
-        );
+        const [group, enrollment] = await Promise.all([
+          deps.store.getDoc<StudyGroup>(
+            `organizations/${ctx.orgId}/groups/${validated.groupId}`,
+            ctx.idToken
+          ),
+          deps.store.getDoc<GroupEnrollment>(
+            `organizations/${ctx.orgId}/enrollments/${validated.groupId}_${validated.studentId}`,
+            ctx.idToken
+          ),
+        ]);
+        if (!group || group.organizationId !== ctx.orgId) {
+          throw new DomainValidationError('المجموعة المحددة غير موجودة في المنظمة.', 'GROUP_NOT_FOUND', 404);
+        }
         if (!enrollment || enrollment.status !== 'active') {
           throw new DomainValidationError(
             'الطالب غير مسجل في المجموعة المحددة.',
@@ -409,7 +430,25 @@ export function createTemaApiRouter(deps: TemaApiDeps): Router {
         })
       );
 
-      await deps.store.commitWrites(writes, ctx.idToken);
+      try {
+        await deps.store.commitWrites(writes, ctx.idToken);
+      } catch (commitErr) {
+        if (validated.idempotencyKey) {
+          const racedKey = await deps.store.getDoc<{ entityId?: string }>(
+            `organizations/${ctx.orgId}/idempotencyKeys/pay_${validated.idempotencyKey}`,
+            ctx.idToken
+          );
+          if (racedKey?.entityId) {
+            res.status(200).json({
+              paymentId: racedKey.entityId,
+              deduplicated: true,
+              correlationId: ctx.correlationId,
+            });
+            return;
+          }
+        }
+        throw commitErr;
+      }
       res.status(201).json({ paymentId, status: validated.status, correlationId: ctx.correlationId });
     } catch (err) {
       sendErrorResponse(res, err, ctx.correlationId);
@@ -467,6 +506,9 @@ export function createTemaApiRouter(deps: TemaApiDeps): Router {
                   80
                 ),
                 updatedAt: SERVER_TIMESTAMP_SENTINEL,
+                ...(settlement.needsAmountBackfill
+                  ? { amountPiasters: settlement.totalPiasters }
+                  : {}),
               },
             },
             {
@@ -584,71 +626,89 @@ export function createTemaApiRouter(deps: TemaApiDeps): Router {
             : {}),
         };
 
-        await deps.store.commitWrites(
-          [
-            {
-              type: 'update',
-              path: `organizations/${ctx.orgId}/payments/${paymentId}`,
-              data: payUpdateData,
-            },
-            {
-              type: 'set',
-              path: `organizations/${ctx.orgId}/ledgerEntries/${entryId}`,
-              data: {
-                id: entryId,
-                organizationId: ctx.orgId,
-                entryType: 'adjustment',
-                direction,
-                entityType: 'payment',
-                entityId: paymentId,
-                studentId: existing.studentId,
-                studentName: existing.studentName,
-                groupId: existing.groupId || '',
-                amountPiasters: validatedAdj.amountPiasters,
-                amount: validatedAdj.amount,
-                currency: 'EGP',
-                idempotencyKey: effectiveKey,
-                description: `تسوية محاسبية (${direction}): ${validatedAdj.cleanReason}`,
-                recordedBy: ctx.member.uid,
-                createdAt: SERVER_TIMESTAMP_SENTINEL,
+        try {
+          await deps.store.commitWrites(
+            [
+              {
+                type: 'update',
+                path: `organizations/${ctx.orgId}/payments/${paymentId}`,
+                data: payUpdateData,
               },
-            },
-            {
-              type: 'set',
-              path: `organizations/${ctx.orgId}/idempotencyKeys/${keyDocId}`,
-              data: {
-                id: keyDocId,
-                organizationId: ctx.orgId,
+              {
+                type: 'set',
+                path: `organizations/${ctx.orgId}/ledgerEntries/${entryId}`,
+                data: {
+                  id: entryId,
+                  organizationId: ctx.orgId,
+                  entryType: 'adjustment',
+                  direction,
+                  entityType: 'payment',
+                  entityId: paymentId,
+                  studentId: existing.studentId,
+                  studentName: existing.studentName,
+                  groupId: existing.groupId || '',
+                  amountPiasters: validatedAdj.amountPiasters,
+                  amount: validatedAdj.amount,
+                  currency: 'EGP',
+                  idempotencyKey: effectiveKey,
+                  description: `تسوية محاسبية (${direction}): ${validatedAdj.cleanReason}`,
+                  recordedBy: ctx.member.uid,
+                  createdAt: SERVER_TIMESTAMP_SENTINEL,
+                },
+              },
+              {
+                type: 'set',
+                path: `organizations/${ctx.orgId}/idempotencyKeys/${keyDocId}`,
+                data: {
+                  id: keyDocId,
+                  organizationId: ctx.orgId,
+                  entityType: 'ledger_entry',
+                  entityId: entryId,
+                  createdBy: ctx.member.uid,
+                  createdAt: SERVER_TIMESTAMP_SENTINEL,
+                },
+              },
+              buildAuditWrite(ctx.orgId, ctx.member, {
+                action: 'payment.adjusted',
                 entityType: 'ledger_entry',
                 entityId: entryId,
-                createdBy: ctx.member.uid,
-                createdAt: SERVER_TIMESTAMP_SENTINEL,
-              },
-            },
-            buildAuditWrite(ctx.orgId, ctx.member, {
-              action: 'payment.adjusted',
-              entityType: 'ledger_entry',
-              entityId: entryId,
-              summary: `تسوية محاسبية (${direction}) بقيمة ${validatedAdj.amount} ج.م على القيد ${paymentId}.`,
-              result: 'success',
-              correlationId: ctx.correlationId,
-              metadata: {
-                before: {
-                  adjustedCreditPiasters: validatedAdj.prevAdjustedCredit,
-                  adjustedDebitPiasters: validatedAdj.prevAdjustedDebit,
+                summary: `تسوية محاسبية (${direction}) بقيمة ${validatedAdj.amount} ج.م على القيد ${paymentId}.`,
+                result: 'success',
+                correlationId: ctx.correlationId,
+                metadata: {
+                  before: {
+                    adjustedCreditPiasters: validatedAdj.prevAdjustedCredit,
+                    adjustedDebitPiasters: validatedAdj.prevAdjustedDebit,
+                  },
+                  after: {
+                    paymentId,
+                    direction,
+                    amountPiasters: validatedAdj.amountPiasters,
+                    adjustedCreditPiasters: validatedAdj.nextAdjustedCredit,
+                    adjustedDebitPiasters: validatedAdj.nextAdjustedDebit,
+                  },
                 },
-                after: {
-                  paymentId,
-                  direction,
-                  amountPiasters: validatedAdj.amountPiasters,
-                  adjustedCreditPiasters: validatedAdj.nextAdjustedCredit,
-                  adjustedDebitPiasters: validatedAdj.nextAdjustedDebit,
-                },
-              },
-            }),
-          ],
-          ctx.idToken
-        );
+              }),
+            ],
+            ctx.idToken
+          );
+        } catch (commitErr) {
+          if (rawKey.length > 0) {
+            const racedKey = await deps.store.getDoc<{ entityId?: string }>(
+              `organizations/${ctx.orgId}/idempotencyKeys/${keyDocId}`,
+              ctx.idToken
+            );
+            if (racedKey?.entityId) {
+              res.status(200).json({
+                entryId: racedKey.entityId,
+                deduplicated: true,
+                correlationId: ctx.correlationId,
+              });
+              return;
+            }
+          }
+          throw commitErr;
+        }
 
         res.status(201).json({
           entryId,
@@ -694,9 +754,10 @@ export function createTemaApiRouter(deps: TemaApiDeps): Router {
           throw new DomainValidationError('هذا القيد المالي ملغى بالفعل.', 'ALREADY_VOIDED', 409);
         }
 
-        const totalPiasters = resolveRecordPiasters(existing.amountPiasters, existing.amount);
-        const paidPiasters = resolveRecordPiasters(existing.paidAmountPiasters, existing.paidAmount);
-        const duePiasters = Math.max(0, totalPiasters - paidPiasters);
+        const resolved = resolveValidatedPaymentPiasters(existing);
+        const totalPiasters = resolved.amountPiasters;
+        const paidPiasters = resolved.paidAmountPiasters;
+        const duePiasters = resolved.dueAmountPiasters;
         const chargeReversalId = `${paymentId}_rev_charge`;
 
         const writes: RestWriteInstruction[] = [
@@ -709,13 +770,9 @@ export function createTemaApiRouter(deps: TemaApiDeps): Router {
               voidedBy: ctx.member.uid,
               voidedAt: SERVER_TIMESTAMP_SENTINEL,
               updatedAt: SERVER_TIMESTAMP_SENTINEL,
-              ...(typeof existing.amountPiasters !== 'number'
-                ? {
-                    amountPiasters: totalPiasters,
-                    paidAmountPiasters: paidPiasters,
-                    dueAmountPiasters: duePiasters,
-                  }
-                : {}),
+              ...(resolved.needsBackfill.amountPiasters ? { amountPiasters: totalPiasters } : {}),
+              ...(resolved.needsBackfill.paidAmountPiasters ? { paidAmountPiasters: paidPiasters } : {}),
+              ...(resolved.needsBackfill.dueAmountPiasters ? { dueAmountPiasters: duePiasters } : {}),
             },
           },
           {
@@ -805,6 +862,21 @@ export function createTemaApiRouter(deps: TemaApiDeps): Router {
         idempotencyKey: typeof body.idempotencyKey === 'string' ? body.idempotencyKey : undefined,
       });
 
+      if (validated.idempotencyKey) {
+        const keyDoc = await deps.store.getDoc<{ entityId?: string }>(
+          `organizations/${ctx.orgId}/idempotencyKeys/exp_${validated.idempotencyKey}`,
+          ctx.idToken
+        );
+        if (keyDoc?.entityId) {
+          res.status(200).json({
+            expenseId: keyDoc.entityId,
+            deduplicated: true,
+            correlationId: ctx.correlationId,
+          });
+          return;
+        }
+      }
+
       const expenseId = makeServerId('exp');
       const entryId = `${expenseId}_charge`;
       const writes: RestWriteInstruction[] = [
@@ -822,6 +894,7 @@ export function createTemaApiRouter(deps: TemaApiDeps): Router {
             status: 'posted',
             expenseDate: validated.expenseDate,
             notes: validated.notes,
+            ...(validated.idempotencyKey ? { idempotencyKey: validated.idempotencyKey } : {}),
             recordedBy: ctx.member.uid,
             createdAt: SERVER_TIMESTAMP_SENTINEL,
             updatedAt: SERVER_TIMESTAMP_SENTINEL,
@@ -845,6 +918,25 @@ export function createTemaApiRouter(deps: TemaApiDeps): Router {
             createdAt: SERVER_TIMESTAMP_SENTINEL,
           },
         },
+      ];
+
+      if (validated.idempotencyKey) {
+        const keyDocId = `exp_${validated.idempotencyKey}`;
+        writes.push({
+          type: 'set',
+          path: `organizations/${ctx.orgId}/idempotencyKeys/${keyDocId}`,
+          data: {
+            id: keyDocId,
+            organizationId: ctx.orgId,
+            entityType: 'expense',
+            entityId: expenseId,
+            createdBy: ctx.member.uid,
+            createdAt: SERVER_TIMESTAMP_SENTINEL,
+          },
+        });
+      }
+
+      writes.push(
         buildAuditWrite(ctx.orgId, ctx.member, {
           action: 'expense.created',
           entityType: 'expense',
@@ -853,15 +945,120 @@ export function createTemaApiRouter(deps: TemaApiDeps): Router {
           result: 'success',
           correlationId: ctx.correlationId,
           metadata: { after: { amountPiasters: validated.amountPiasters } },
-        }),
-      ];
+        })
+      );
 
-      await deps.store.commitWrites(writes, ctx.idToken);
+      try {
+        await deps.store.commitWrites(writes, ctx.idToken);
+      } catch (commitErr) {
+        if (validated.idempotencyKey) {
+          const racedKey = await deps.store.getDoc<{ entityId?: string }>(
+            `organizations/${ctx.orgId}/idempotencyKeys/exp_${validated.idempotencyKey}`,
+            ctx.idToken
+          );
+          if (racedKey?.entityId) {
+            res.status(200).json({
+              expenseId: racedKey.entityId,
+              deduplicated: true,
+              correlationId: ctx.correlationId,
+            });
+            return;
+          }
+        }
+        throw commitErr;
+      }
       res.status(201).json({ expenseId, correlationId: ctx.correlationId });
     } catch (err) {
       sendErrorResponse(res, err, ctx.correlationId);
     }
   });
+
+  // POST /api/v1/organizations/:orgId/expenses/:expenseId/void
+  router.post(
+    '/organizations/:orgId/expenses/:expenseId/void',
+    async (req: Request, res: Response) => {
+      const ctx = await authorizeRequest(req, res, deps, 'expenses:reverse');
+      if (!ctx) return;
+
+      try {
+        const expenseId = req.params.expenseId;
+        if (!expenseId || !isValidEntityId(expenseId)) {
+          throw new DomainValidationError('معرّف المصروف غير صالح.', 'INVALID_EXPENSE_ID');
+        }
+
+        const body = (req.body ?? {}) as Record<string, unknown>;
+        const cleanReason = sanitizeText(typeof body.reason === 'string' ? body.reason : '', 200);
+        if (cleanReason.length < 3) {
+          throw new DomainValidationError('سبب الإلغاء مطلوب (3 أحرف على الأقل).', 'VOID_REASON_REQUIRED');
+        }
+
+        const existing = await deps.store.getDoc<ExpenseRecord>(
+          `organizations/${ctx.orgId}/expenses/${expenseId}`,
+          ctx.idToken
+        );
+        if (!existing || existing.organizationId !== ctx.orgId) {
+          throw new DomainValidationError('قيد المصروف غير موجود.', 'EXPENSE_NOT_FOUND', 404);
+        }
+        if (existing.status === 'voided') {
+          throw new DomainValidationError('هذا المصروف ملغى بالفعل.', 'ALREADY_VOIDED', 409);
+        }
+
+        const resolved = resolveValidatedExpensePiasters(existing);
+        const amountPiasters = resolved.amountPiasters;
+        const reversalId = `${expenseId}_rev_charge`;
+
+        const writes: RestWriteInstruction[] = [
+          {
+            type: 'update',
+            path: `organizations/${ctx.orgId}/expenses/${expenseId}`,
+            data: {
+              status: 'voided',
+              voidReason: cleanReason,
+              voidedBy: ctx.member.uid,
+              voidedAt: SERVER_TIMESTAMP_SENTINEL,
+              updatedAt: SERVER_TIMESTAMP_SENTINEL,
+              ...(resolved.needsBackfill ? { amountPiasters } : {}),
+            },
+          },
+          {
+            type: 'set',
+            path: `organizations/${ctx.orgId}/ledgerEntries/${reversalId}`,
+            data: {
+              id: reversalId,
+              organizationId: ctx.orgId,
+              entryType: 'reversal',
+              direction: 'credit',
+              entityType: 'expense',
+              entityId: expenseId,
+              amountPiasters,
+              amount: piastersToEgp(amountPiasters),
+              currency: 'EGP',
+              description: `عكس مصروف (${existing.title}): ${cleanReason}`,
+              recordedBy: ctx.member.uid,
+              createdAt: SERVER_TIMESTAMP_SENTINEL,
+            },
+          },
+          buildAuditWrite(ctx.orgId, ctx.member, {
+            action: 'expense.voided',
+            entityType: 'expense',
+            entityId: expenseId,
+            summary: `عكس وإلغاء قيد المصروف (${expenseId}) — ${cleanReason}`,
+            result: 'success',
+            correlationId: ctx.correlationId,
+            metadata: {
+              before: { status: existing.status },
+              after: { status: 'voided', voidReason: cleanReason },
+            },
+          }),
+        ];
+
+        await deps.store.commitWrites(writes, ctx.idToken);
+        res.status(200).json({ expenseId, status: 'voided', correlationId: ctx.correlationId });
+      } catch (err) {
+        sendErrorResponse(res, err, ctx.correlationId);
+      }
+    }
+  );
 
   // POST /api/v1/organizations/:orgId/enrollments
   router.post('/organizations/:orgId/enrollments', async (req: Request, res: Response) => {
